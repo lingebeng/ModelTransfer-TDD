@@ -1,0 +1,19 @@
+[project]
+name = "modeltransfer-tdd"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "jax>=0.9.0",
+    "pre-commit>=4.5.1",
+    "ruff>=0.14.14",
+    "torch>=2.10.0",
+    "transformers>=5.0.0",
+]
+# pyproject.toml
+[tool.ruff.lint.per-file-ignores]
+# 忽略所有 smoke_test 文件的 E402 错误
+"**/smoke_test_*.py" = ["E402"]
+# 或者忽略整个 pytorch 目录下的 E402
+"Mimo-V2-Flash/pytorch/*.py" = ["E402"]
