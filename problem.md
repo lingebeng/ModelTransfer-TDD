@@ -34,3 +34,8 @@
 - 现象：`KeyError: Missing required keys in rope_parameters ...`
 - 根因：HF 5.x 对 `rope_scaling` 要求必须含 `rope_type` 及其必需字段。
 - 处理：在测试 config 中传入 `rope_scaling={"rope_type": "linear", "factor": 1.0}`。
+
+### 7) test_output_mimo 全量对比出现 NaN
+- 现象：`test_output_mimo.py` 中 JAX logits 出现 NaN，导致与 torch 对比失败。
+- 根因：PyTorch 版本 `MiMoV2MoEGate` 的 `weight` 和 `e_score_correction_bias` 用 `torch.empty` 创建，未初始化就参与计算；保存成 safetensors 后 JAX 侧加载得到 NaN。
+- 处理：在测试里手动初始化 gate 权重（`normal_(0, 0.02)`）与 `e_score_correction_bias`（zeros），保证有限值再进行对比测试。
