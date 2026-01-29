@@ -254,11 +254,13 @@ def create_model_from_safe_tensors(
                 jax_key, transform = _torch_key_to_jax_key(key_mapping, torch_key)
                 if jax_key is None:
                     continue
-                transform = (
-                    _resolve_transform(transform.value, jax_key, cfg)
-                    if transform is not None
-                    else None
-                )
+                if transform is not None:
+                    transform_val = (
+                        transform.value if hasattr(transform, "value") else transform
+                    )
+                    transform = _resolve_transform(transform_val, jax_key, cfg)
+                else:
+                    transform = None
                 keys = [_stoi(k) for k in jax_key.split(".")]
                 try:
                     _assign_weights(

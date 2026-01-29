@@ -10,7 +10,10 @@ from jax.sharding import PartitionSpec as P
 from jax.sharding import get_abstract_mesh, reshard
 from jaxtyping import Array, ArrayLike
 
-from .config import ModelConfig, ShardingCfg
+try:
+    from .config import ModelConfig, ShardingCfg
+except ImportError:
+    from config import ModelConfig, ShardingCfg
 
 _K_MASK = jnp.finfo(jnp.bfloat16).min
 ShardingSpec: TypeAlias = P
