@@ -84,9 +84,9 @@ class Einsum(nnx.Module):
 
     @jax.named_scope("einsum")
     def __call__(self, x: ArrayLike) -> Array:
-        y = jnp.einsum(self.einsum_str, x, self.w.value)
+        y = jnp.einsum(self.einsum_str, x, self.w[...])
         if self.b is not None:
-            y = y + self.b.value
+            y = y + self.b[...]
         return y
 
 
@@ -144,7 +144,7 @@ class RMSNorm(nnx.Module):
             jnp.mean(jnp.astype(x, jnp.float32) ** 2, axis=-1, keepdims=True)
             + self.norm_eps
         )
-        return jnp.astype(self.scale.value * x / rms, dtype)
+        return jnp.astype(self.scale[...] * x / rms, dtype)
 
 
 def count_left_pads(x: jax.Array) -> int:
@@ -206,7 +206,7 @@ class MoEGate(nnx.Module):
         bsz, seq_len, h = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, h)
         logits = jnp.matmul(
-            hidden_states.astype(jnp.float32), self.w.value.T.astype(jnp.float32)
+            hidden_states.astype(jnp.float32), self.w[...].T.astype(jnp.float32)
         )
         if self.scoring_func == "sigmoid":
             scores = jax.nn.sigmoid(logits)
@@ -221,7 +221,7 @@ class MoEGate(nnx.Module):
         if self.e_score_correction_bias is None:
             raise ValueError("e_score_correction_bias must be set for noaux_tc")
 
-        scores_for_choice = scores + self.e_score_correction_bias.value[None, :]
+        scores_for_choice = scores + self.e_score_correction_bias[...][None, :]
         scores_grouped = scores_for_choice.reshape(bsz * seq_len, self.n_group, -1)
         top2 = jax.lax.top_k(scores_grouped, k=2)[0]
         group_scores = jnp.sum(top2, axis=-1)
@@ -353,11 +353,11 @@ class Attention(nnx.Module):
 
         left_pads = count_left_pads(segment_ids)
         left_pads = shard(left_pads, P(self.shd_cfg.act_btnh[0]))
-        cache.start_ind.value = jnp.where(
-            cache.start_ind.value < 0, left_pads, cache.start_ind.value
+        cache.start_ind[...] = jnp.where(
+            cache.start_ind[...] < 0, left_pads, cache.start_ind[...]
         )
         position_ids = (
-            compute_positions_from_segment_ids(segment_ids) + cache.cur_ind.value
+            compute_positions_from_segment_ids(segment_ids) + cache.cur_ind[...]
         )
         sin, cos = _generate_pos_embeddings(
             position_ids, self.rope_dim, self.rope_theta
@@ -365,32 +365,32 @@ class Attention(nnx.Module):
         query_proj = apply_rope_partial(query_proj, sin, cos, self.rope_dim)
         key_proj = apply_rope_partial(key_proj, sin, cos, self.rope_dim)
 
-        slice_indices = (0, cache.cur_ind.value, 0, 0)
-        cache.v_cache.value = jax.lax.dynamic_update_slice(
-            cache.v_cache.value, value_proj, slice_indices
+        slice_indices = (0, cache.cur_ind[...], 0, 0)
+        cache.v_cache[...] = jax.lax.dynamic_update_slice(
+            cache.v_cache[...], value_proj, slice_indices
         )
-        cache.k_cache.value = jax.lax.dynamic_update_slice(
-            cache.k_cache.value, key_proj, slice_indices
+        cache.k_cache[...] = jax.lax.dynamic_update_slice(
+            cache.k_cache[...], key_proj, slice_indices
         )
 
         b, t, n, _ = query_proj.shape
-        key_cache = repeat_kv(cache.k_cache.value, self.n_rep)
-        value_cache = repeat_kv(cache.v_cache.value, self.n_rep)
+        key_cache = repeat_kv(cache.k_cache[...], self.n_rep)
+        value_cache = repeat_kv(cache.v_cache[...], self.n_rep)
 
         attn_logits = (
             jnp.einsum("BTNH,BSNH->BTNS", query_proj, key_cache) * self.scaling
         )
 
         q_pos = (
-            cache.cur_ind.value
+            cache.cur_ind[...]
             + jnp.arange(t, dtype=jnp.int32)[None, :]
-            - cache.start_ind.value[:, None]
+            - cache.start_ind[...][:, None]
         )
         ts = jnp.arange(cache.size, dtype=jnp.int32)
-        kv_segment_ids = (ts[None, :] >= cache.start_ind.value[:, None]) & (
-            ts[None, :] < cache.cur_ind.value + t
+        kv_segment_ids = (ts[None, :] >= cache.start_ind[...][:, None]) & (
+            ts[None, :] < cache.cur_ind[...] + t
         )
-        k_pos = ts[None, :] - cache.start_ind.value[:, None]
+        k_pos = ts[None, :] - cache.start_ind[...][:, None]
         causal_mask = k_pos[:, None, :] <= q_pos[:, :, None]
         segment_mask = kv_segment_ids[:, None, :] == segment_ids[:, :, None]
         if self.sliding_window is None:
@@ -403,7 +403,7 @@ class Attention(nnx.Module):
         attn_logits = jnp.where(final_mask[:, :, None, :], attn_logits, _K_MASK)
 
         if self.use_sink_bias:
-            sink_logits = self.attention_sink_bias.value[None, None, :, None]
+            sink_logits = self.attention_sink_bias[...][None, None, :, None]
             sink_logits = jnp.broadcast_to(sink_logits, (b, t, n, 1))
             attn_logits = jnp.concatenate([attn_logits, sink_logits], axis=-1)
 
@@ -415,7 +415,7 @@ class Attention(nnx.Module):
 
         attn_output = jnp.einsum("BTNS,BSNV->BTNV", attn_weights, value_cache)
 
-        cache.cur_ind.value = cache.cur_ind.value + t
+        cache.cur_ind[...] = cache.cur_ind[...] + t
         return shard(self.o_proj(attn_output), self.shd_cfg.act_btd)
 
 
@@ -486,8 +486,10 @@ class MiMoV2Flash(nnx.Module):
         return caches
 
     def __call__(self, tokens, segment_ids, cache, num_right_pads):
-        x = self.embedder.embedding.value.at[(tokens,)].get(
-            out_sharding=self.out_emb_shd
+        x = (
+            self.embedder.embedding[...]
+            .at[(tokens,)]
+            .get(out_sharding=self.out_emb_shd)
         )
         for i, layer in enumerate(self.layers):
             x = layer(x, cache[i], segment_ids)

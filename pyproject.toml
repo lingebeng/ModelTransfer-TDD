@@ -19,3 +19,5 @@ dependencies = [
 "**/smoke_test_*.py" = ["E402"]
 # 或者忽略整个 pytorch 目录下的 E402
 "Mimo-V2-Flash/pytorch/*.py" = ["E402"]
+# 忽略 test 目录下所有文件的 E402 错误
+"**/test/**/*.py" = ["E402"]
