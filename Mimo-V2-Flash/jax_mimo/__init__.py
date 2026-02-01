@@ -1,4 +1,4 @@
-from .config import MiMoV2FlashConfig
-from .model import MiMoV2FlashForCausalLM
+from .modeling import ModelConfig, MiMoV2FlashForCausalLM
+from . import params
 
-__all__ = ["MiMoV2FlashConfig", "MiMoV2FlashForCausalLM"]
+__all__ = ["ModelConfig", "MiMoV2FlashForCausalLM", "params"]
