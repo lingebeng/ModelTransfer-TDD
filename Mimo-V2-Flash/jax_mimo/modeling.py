@@ -1,9 +1,9 @@
 import dataclasses
 from typing import Callable, Optional, Sequence, Tuple
 
-import flax.linen as nn
 import jax
 import jax.numpy as jnp
+from flax import nnx
 
 
 @dataclasses.dataclass
@@ -166,7 +166,7 @@ class ModelConfig:
 
 def _get_act_fn(name: str) -> Callable[[jnp.ndarray], jnp.ndarray]:
     if name == "silu":
-        return nn.silu
+        return jax.nn.silu
     raise ValueError(f"unsupported activation: {name}")
 
 
@@ -227,64 +227,65 @@ def apply_rotary_pos_emb(
     return q_embed, k_embed
 
 
-class RMSNorm(nn.Module):
-    hidden_size: int
-    eps: float
+class RMSNorm(nnx.Module):
+    def __init__(self, hidden_size: int, eps: float, *, rngs: nnx.Rngs):
+        self.weight = nnx.Param(nnx.initializers.ones_init()(rngs.params(), (hidden_size,)))
+        self.eps = eps
 
-    @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        weight = self.param("weight", nn.initializers.ones, (self.hidden_size,))
+        dtype = x.dtype
         x_float = x.astype(jnp.float32)
         variance = jnp.mean(jnp.square(x_float), axis=-1, keepdims=True)
         x_norm = x_float * jnp.reciprocal(jnp.sqrt(variance + self.eps))
-        return (x_norm * weight).astype(x.dtype)
+        return (x_norm * self.weight[...]).astype(dtype)
 
 
-class MLP(nn.Module):
-    hidden_size: int
-    intermediate_size: int
-    hidden_act: str
+class MLP(nnx.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        hidden_act: str,
+        *,
+        rngs: nnx.Rngs,
+    ):
+        self.gate_proj = nnx.Linear(hidden_size, intermediate_size, use_bias=False, rngs=rngs)
+        self.up_proj = nnx.Linear(hidden_size, intermediate_size, use_bias=False, rngs=rngs)
+        self.down_proj = nnx.Linear(intermediate_size, hidden_size, use_bias=False, rngs=rngs)
+        self.act_fn = _get_act_fn(hidden_act)
 
-    @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        gate_proj = nn.Dense(self.intermediate_size, use_bias=False, name="gate_proj")
-        up_proj = nn.Dense(self.intermediate_size, use_bias=False, name="up_proj")
-        down_proj = nn.Dense(self.hidden_size, use_bias=False, name="down_proj")
-        act_fn = _get_act_fn(self.hidden_act)
-        return down_proj(act_fn(gate_proj(x)) * up_proj(x))
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
-class MiMoV2MoEGate(nn.Module):
-    config: ModelConfig
-
-    def setup(self) -> None:
-        self.top_k = self.config.num_experts_per_tok
-        self.n_routed_experts = self.config.n_routed_experts
+class MiMoV2MoEGate(nnx.Module):
+    def __init__(self, config: ModelConfig, *, rngs: nnx.Rngs):
+        self.config = config
+        self.top_k = config.num_experts_per_tok
+        self.n_routed_experts = config.n_routed_experts
         self.routed_scaling_factor = (
-            self.config.routed_scaling_factor
-            if self.config.routed_scaling_factor is not None
-            else 1.0
+            config.routed_scaling_factor if config.routed_scaling_factor is not None else 1.0
         )
-        self.scoring_func = self.config.scoring_func
-        self.topk_method = self.config.topk_method
-        self.n_group = self.config.n_group
-        self.topk_group = self.config.topk_group
-        self.norm_topk_prob = self.config.norm_topk_prob
-        self.gating_dim = self.config.hidden_size
-        self.weight = self.param(
-            "weight",
-            nn.initializers.normal(self.config.initializer_range),
-            (self.n_routed_experts, self.gating_dim),
+        self.scoring_func = config.scoring_func
+        self.topk_method = config.topk_method
+        self.n_group = config.n_group
+        self.topk_group = config.topk_group
+        self.norm_topk_prob = config.norm_topk_prob
+        self.gating_dim = config.hidden_size
+        self.weight = nnx.Param(
+            nnx.initializers.normal(stddev=config.initializer_range)(
+                rngs.params(), (self.n_routed_experts, self.gating_dim)
+            )
         )
         if self.topk_method == "noaux_tc":
-            self.e_score_correction_bias = self.param(
-                "e_score_correction_bias", nn.initializers.zeros, (self.n_routed_experts,)
+            self.e_score_correction_bias = nnx.Param(
+                nnx.initializers.zeros_init()(rngs.params(), (self.n_routed_experts,))
             )
 
     def __call__(self, hidden_states: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
         bsz, seq_len, h = hidden_states.shape
         x = hidden_states.reshape(-1, h)
-        logits = jnp.dot(x.astype(jnp.float32), self.weight.T.astype(jnp.float32))
+        logits = jnp.dot(x.astype(jnp.float32), self.weight[...].T.astype(jnp.float32))
         if self.scoring_func == "sigmoid":
             scores = jax.nn.sigmoid(logits)
         else:
@@ -315,20 +316,21 @@ class MiMoV2MoEGate(nn.Module):
         return topk_idx, topk_weight
 
 
-class MiMoV2MoE(nn.Module):
-    config: ModelConfig
-
-    def setup(self) -> None:
-        self.experts = [
-            MLP(
-                hidden_size=self.config.hidden_size,
-                intermediate_size=self.config.moe_intermediate_size,
-                hidden_act=self.config.hidden_act,
-                name=f"expert_{i}",
-            )
-            for i in range(self.config.n_routed_experts)
-        ]
-        self.gate = MiMoV2MoEGate(self.config)
+class MiMoV2MoE(nnx.Module):
+    def __init__(self, config: ModelConfig, *, rngs: nnx.Rngs):
+        self.config = config
+        self.experts = nnx.List(
+            [
+                MLP(
+                    hidden_size=config.hidden_size,
+                    intermediate_size=config.moe_intermediate_size,
+                    hidden_act=config.hidden_act,
+                    rngs=rngs,
+                )
+                for _ in range(config.n_routed_experts)
+            ]
+        )
+        self.gate = MiMoV2MoEGate(config, rngs=rngs)
 
     def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
         orig_shape = hidden_states.shape
@@ -352,25 +354,26 @@ def repeat_kv(x: jnp.ndarray, n_rep: int) -> jnp.ndarray:
     return jnp.repeat(x, repeats=n_rep, axis=1)
 
 
-class MiMoV2Attention(nn.Module):
-    config: ModelConfig
-    is_swa: bool
+class MiMoV2Attention(nnx.Module):
+    def __init__(self, config: ModelConfig, is_swa: bool, layer_idx: int, *, rngs: nnx.Rngs):
+        self.config = config
+        self.is_swa = is_swa
+        self.layer_idx = layer_idx
 
-    def setup(self) -> None:
-        if self.is_swa:
-            self.head_dim = self.config.swa_head_dim
-            self.v_head_dim = self.config.swa_v_head_dim
-            self.num_attention_heads = self.config.swa_num_attention_heads
-            self.num_key_value_heads = self.config.swa_num_key_value_heads
-            self.rope_theta = self.config.swa_rope_theta
+        if is_swa:
+            self.head_dim = config.swa_head_dim
+            self.v_head_dim = config.swa_v_head_dim
+            self.num_attention_heads = config.swa_num_attention_heads
+            self.num_key_value_heads = config.swa_num_key_value_heads
+            self.rope_theta = config.swa_rope_theta
         else:
-            self.head_dim = self.config.head_dim
-            self.v_head_dim = self.config.v_head_dim
-            self.num_attention_heads = self.config.num_attention_heads
-            self.num_key_value_heads = self.config.num_key_value_heads
-            self.rope_theta = self.config.rope_theta
+            self.head_dim = config.head_dim
+            self.v_head_dim = config.v_head_dim
+            self.num_attention_heads = config.num_attention_heads
+            self.num_key_value_heads = config.num_key_value_heads
+            self.rope_theta = config.rope_theta
 
-        self.rope_dim = int(self.head_dim * self.config.partial_rotary_factor)
+        self.rope_dim = int(self.head_dim * config.partial_rotary_factor)
         self.num_key_value_groups = self.num_attention_heads // self.num_key_value_heads
         self.scaling = self.head_dim ** -0.5
 
@@ -379,20 +382,20 @@ class MiMoV2Attention(nn.Module):
         v_hidden_size = self.num_key_value_heads * self.v_head_dim
         o_hidden_size = self.num_attention_heads * self.v_head_dim
 
-        self.q_proj = nn.Dense(q_hidden_size, use_bias=self.config.attention_bias, name="q_proj")
-        self.k_proj = nn.Dense(k_hidden_size, use_bias=self.config.attention_bias, name="k_proj")
-        self.v_proj = nn.Dense(v_hidden_size, use_bias=self.config.attention_bias, name="v_proj")
-        self.o_proj = nn.Dense(o_hidden_size, use_bias=False, name="o_proj")
-        self.dropout = nn.Dropout(self.config.attention_dropout)
-        self.use_sink = (self.config.add_swa_attention_sink_bias and self.is_swa) or (
-            self.config.add_full_attention_sink_bias and not self.is_swa
+        self.q_proj = nnx.Linear(config.hidden_size, q_hidden_size, use_bias=config.attention_bias, rngs=rngs)
+        self.k_proj = nnx.Linear(config.hidden_size, k_hidden_size, use_bias=config.attention_bias, rngs=rngs)
+        self.v_proj = nnx.Linear(config.hidden_size, v_hidden_size, use_bias=config.attention_bias, rngs=rngs)
+        self.o_proj = nnx.Linear(o_hidden_size, config.hidden_size, use_bias=False, rngs=rngs)
+        self.dropout = nnx.Dropout(config.attention_dropout, rngs=rngs)
+        self.use_sink = (config.add_swa_attention_sink_bias and is_swa) or (
+            config.add_full_attention_sink_bias and not is_swa
         )
         if self.use_sink:
-            self.attention_sink_bias = self.param(
-                "attention_sink_bias",
-                nn.initializers.zeros,
-                (self.num_attention_heads,),
+            self.attention_sink_bias = nnx.Param(
+                nnx.initializers.zeros_init()(rngs.params(), (self.num_attention_heads,))
             )
+        else:
+            self.attention_sink_bias = None
 
     def _apply_rope(self, q: jnp.ndarray, k: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
         seq_len = q.shape[-2]
@@ -411,6 +414,7 @@ class MiMoV2Attention(nn.Module):
         position_ids: Optional[jnp.ndarray],
         deterministic: bool = True,
     ) -> jnp.ndarray:
+        del position_ids
         bsz, seq_len, _ = hidden_states.shape
         q = self.q_proj(hidden_states)
         k = self.k_proj(hidden_states)
@@ -444,24 +448,24 @@ class MiMoV2Attention(nn.Module):
         return self.o_proj(attn_output)
 
 
-class MiMoV2DecoderLayer(nn.Module):
-    config: ModelConfig
-    layer_idx: int
-
-    def setup(self) -> None:
-        is_swa_layer = self.config.hybrid_layer_pattern[self.layer_idx] == 1
+class MiMoV2DecoderLayer(nnx.Module):
+    def __init__(self, config: ModelConfig, layer_idx: int, *, rngs: nnx.Rngs):
+        self.config = config
+        self.layer_idx = layer_idx
+        is_swa_layer = config.hybrid_layer_pattern[layer_idx] == 1
         self.attention_type = "sliding_window_attention" if is_swa_layer else "full_attention"
-        self.self_attn = MiMoV2Attention(self.config, is_swa_layer)
-        if self.config.n_routed_experts is not None and self.config.moe_layer_freq[self.layer_idx]:
-            self.mlp = MiMoV2MoE(self.config)
+        self.self_attn = MiMoV2Attention(config, is_swa_layer, layer_idx, rngs=rngs)
+        if config.n_routed_experts is not None and config.moe_layer_freq[layer_idx]:
+            self.mlp = MiMoV2MoE(config, rngs=rngs)
         else:
             self.mlp = MLP(
-                hidden_size=self.config.hidden_size,
-                intermediate_size=self.config.intermediate_size,
-                hidden_act=self.config.hidden_act,
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                hidden_act=config.hidden_act,
+                rngs=rngs,
             )
-        self.input_layernorm = RMSNorm(self.config.hidden_size, eps=self.config.layernorm_epsilon)
-        self.post_attention_layernorm = RMSNorm(self.config.hidden_size, eps=self.config.layernorm_epsilon)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon, rngs=rngs)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon, rngs=rngs)
 
     def __call__(
         self,
@@ -487,16 +491,14 @@ class MiMoV2DecoderLayer(nn.Module):
         return hidden_states
 
 
-class MiMoV2Model(nn.Module):
-    config: ModelConfig
-
-    def setup(self) -> None:
-        self.embed_tokens = nn.Embed(self.config.vocab_size, self.config.hidden_size)
-        self.layers = [
-            MiMoV2DecoderLayer(self.config, layer_idx=i, name=f"layer_{i}")
-            for i in range(self.config.num_hidden_layers)
-        ]
-        self.norm = RMSNorm(self.config.hidden_size, eps=self.config.layernorm_epsilon)
+class MiMoV2Model(nnx.Module):
+    def __init__(self, config: ModelConfig, *, rngs: nnx.Rngs):
+        self.config = config
+        self.embed_tokens = nnx.Embed(config.vocab_size, config.hidden_size, rngs=rngs)
+        self.layers = nnx.List(
+            [MiMoV2DecoderLayer(config, layer_idx=i, rngs=rngs) for i in range(config.num_hidden_layers)]
+        )
+        self.norm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon, rngs=rngs)
 
     def __call__(
         self,
@@ -529,12 +531,11 @@ class MiMoV2Model(nn.Module):
         return hidden_states
 
 
-class MiMoV2FlashForCausalLM(nn.Module):
-    config: ModelConfig
-
-    def setup(self) -> None:
-        self.model = MiMoV2Model(self.config)
-        self.lm_head = nn.Dense(self.config.vocab_size, use_bias=False)
+class MiMoV2FlashForCausalLM(nnx.Module):
+    def __init__(self, config: ModelConfig, *, rngs: nnx.Rngs):
+        self.config = config
+        self.model = MiMoV2Model(config, rngs=rngs)
+        self.lm_head = nnx.Linear(config.hidden_size, config.vocab_size, use_bias=False, rngs=rngs)
 
     def __call__(
         self,
@@ -557,4 +558,6 @@ __all__ = [
     "MiMoV2DecoderLayer",
     "MiMoV2Attention",
     "MiMoV2MoE",
+    "RMSNorm",
+    "make_attention_mask",
 ]

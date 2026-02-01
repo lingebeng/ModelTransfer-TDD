@@ -65,7 +65,6 @@ class TestTinyForward(absltest.TestCase):
             torch_cfg.sliding_window = 8
 
         torch_model = MiMoV2FlashForCausalLM(torch_cfg).eval()
-        # MoE gate uses torch.empty; ensure deterministic finite init for tests.
         for module in torch_model.modules():
             if isinstance(module, mimo_flash.MiMoV2MoEGate):
                 torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
@@ -73,29 +72,14 @@ class TestTinyForward(absltest.TestCase):
                     torch.nn.init.zeros_(module.e_score_correction_bias)
 
         jax_cfg = modeling.ModelConfig.from_torch_config(torch_cfg)
-        jax_model = modeling.MiMoV2FlashForCausalLM(jax_cfg)
+        jax_model = params.create_model_from_torch_state_dict(torch_model.state_dict(), jax_cfg)
 
-        batch_size = 2
-        seq_len = 5
-        input_ids = jnp.zeros((batch_size, seq_len), dtype=jnp.int32)
-        attention_mask = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
-        params_init = jax_model.init(
-            jax.random.PRNGKey(0),
-            input_ids,
-            attention_mask=attention_mask,
-            logits_to_keep=1,
-            deterministic=True,
-        )
-        params_loaded = params.convert_state_dict_to_flax(
-            torch_model.state_dict(), params_init, jax_cfg
-        )
         self.torch_model = torch_model
         self.jax_model = jax_model
         self.torch_cfg = torch_cfg
         self.jax_cfg = jax_cfg
-        self.params_loaded = params_loaded
-        self.batch_size = batch_size
-        self.seq_len = seq_len
+        self.batch_size = 2
+        self.seq_len = 5
 
     def _setup_torch_attn(self, input_embeds: torch.Tensor, attention_mask: torch.Tensor):
         past_key_values = DynamicCache(config=self.torch_model.config)
@@ -128,12 +112,10 @@ class TestTinyForward(absltest.TestCase):
         }
 
     def test_embedder(self):
-        tx = torch.randint(
-            0, self.torch_cfg.vocab_size, size=(self.batch_size, self.seq_len)
-        )
+        tx = torch.randint(0, self.torch_cfg.vocab_size, size=(self.batch_size, self.seq_len))
         ty = self.torch_model.model.embed_tokens(tx)
-        j_embed = self.params_loaded["params"]["model"]["embed_tokens"]["embedding"]
-        jy = jnp.asarray(j_embed)[jnp.asarray(tx.numpy())]
+        jx = jnp.asarray(tx.numpy())
+        jy = self.jax_model.model.embed_tokens(jx)
         np.testing.assert_allclose(
             np.array(jy, dtype=np.float32),
             ty.detach().cpu().numpy(),
@@ -150,9 +132,7 @@ class TestTinyForward(absltest.TestCase):
         )
         ty = self.torch_model.model.layers[0].input_layernorm(tx)
         jx = jnp.asarray(tx.numpy())
-        j_weight = self.params_loaded["params"]["model"]["layer_0"]["input_layernorm"]["weight"]
-        norm = modeling.RMSNorm(self.jax_cfg.hidden_size, eps=self.jax_cfg.layernorm_epsilon)
-        jy = norm.apply({"params": {"weight": j_weight}}, jx)
+        jy = self.jax_model.model.layers[0].input_layernorm(jx)
         np.testing.assert_allclose(
             np.array(jy, dtype=np.float32),
             ty.detach().cpu().numpy(),
@@ -190,10 +170,7 @@ class TestTinyForward(absltest.TestCase):
             sliding_window=self.jax_cfg.sliding_window if is_swa else None,
             dtype=jx.dtype,
         )
-        j_attn = modeling.MiMoV2Attention(self.jax_cfg, is_swa=is_swa)
-        j_params = {"params": self.params_loaded["params"]["model"]["layer_0"]["self_attn"]}
-        jy = j_attn.apply(
-            j_params,
+        jy = self.jax_model.model.layers[0].self_attn(
             jx,
             attention_mask=j_mask,
             position_ids=None,
@@ -207,9 +184,7 @@ class TestTinyForward(absltest.TestCase):
         )
 
     def test_tiny_forward_logits(self):
-        tx = torch.randint(
-            1, self.torch_cfg.vocab_size, size=(self.batch_size, self.seq_len)
-        )
+        tx = torch.randint(1, self.torch_cfg.vocab_size, size=(self.batch_size, self.seq_len))
         with torch.no_grad():
             t_logits = self.torch_model(
                 input_ids=tx,
@@ -220,8 +195,7 @@ class TestTinyForward(absltest.TestCase):
 
         input_ids = jnp.asarray(tx.numpy())
         attention_mask = jnp.ones((self.batch_size, self.seq_len), dtype=jnp.int32)
-        j_logits = self.jax_model.apply(
-            self.params_loaded,
+        j_logits = self.jax_model(
             input_ids,
             attention_mask=attention_mask,
             logits_to_keep=1,

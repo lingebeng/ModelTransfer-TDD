@@ -65,14 +65,11 @@ def run_big_model() -> None:
         return
 
     cfg = _load_model_config(args.config_json)
-    model, model_params = params.create_params_from_safetensors(
-        args.ckpt_dir, cfg, input_shape=(1, 1)
-    )
+    model = params.create_model_from_safe_tensors(args.ckpt_dir, cfg)
 
     input_ids = jnp.zeros((args.batch_size, args.seq_len), dtype=jnp.int32)
     attention_mask = jnp.ones_like(input_ids)
-    logits = model.apply(
-        model_params,
+    logits = model(
         input_ids,
         attention_mask=attention_mask,
         logits_to_keep=1,

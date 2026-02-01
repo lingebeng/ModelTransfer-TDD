@@ -3,13 +3,12 @@ import json
 import re
 import sys
 from enum import Enum
-from typing import Dict, Tuple
+from typing import Dict
 
 import jax
-import jax.numpy as jnp
 import safetensors
 from etils import epath
-from flax.core import freeze, unfreeze
+from flax import nnx
 
 from . import modeling
 
@@ -21,92 +20,87 @@ def _get_key_and_transform_mapping(cfg: modeling.ModelConfig):
         EMBED = None
         SCALE = None
 
-    mapping = {
-        r"model\.embed_tokens\.weight": (
-            "model.embed_tokens.embedding",
-            Transform.EMBED,
-        ),
+    return {
+        r"model\.embed_tokens\.weight": ("model.embed_tokens.embedding", Transform.EMBED),
         # attention
         r"model\.layers\.([0-9]+)\.self_attn\.q_proj\.weight": (
-            r"model.layer_\1.self_attn.q_proj.kernel",
+            r"model.layers.\1.self_attn.q_proj.kernel",
             Transform.LINEAR,
         ),
         r"model\.layers\.([0-9]+)\.self_attn\.k_proj\.weight": (
-            r"model.layer_\1.self_attn.k_proj.kernel",
+            r"model.layers.\1.self_attn.k_proj.kernel",
             Transform.LINEAR,
         ),
         r"model\.layers\.([0-9]+)\.self_attn\.v_proj\.weight": (
-            r"model.layer_\1.self_attn.v_proj.kernel",
+            r"model.layers.\1.self_attn.v_proj.kernel",
             Transform.LINEAR,
         ),
         r"model\.layers\.([0-9]+)\.self_attn\.o_proj\.weight": (
-            r"model.layer_\1.self_attn.o_proj.kernel",
+            r"model.layers.\1.self_attn.o_proj.kernel",
             Transform.LINEAR,
         ),
         r"model\.layers\.([0-9]+)\.self_attn\.q_proj\.bias": (
-            r"model.layer_\1.self_attn.q_proj.bias",
+            r"model.layers.\1.self_attn.q_proj.bias",
             Transform.BIAS,
         ),
         r"model\.layers\.([0-9]+)\.self_attn\.k_proj\.bias": (
-            r"model.layer_\1.self_attn.k_proj.bias",
+            r"model.layers.\1.self_attn.k_proj.bias",
             Transform.BIAS,
         ),
         r"model\.layers\.([0-9]+)\.self_attn\.v_proj\.bias": (
-            r"model.layer_\1.self_attn.v_proj.bias",
+            r"model.layers.\1.self_attn.v_proj.bias",
             Transform.BIAS,
         ),
         r"model\.layers\.([0-9]+)\.self_attn\.attention_sink_bias": (
-            r"model.layer_\1.self_attn.attention_sink_bias",
+            r"model.layers.\1.self_attn.attention_sink_bias",
             Transform.BIAS,
         ),
         # mlp (dense)
         r"model\.layers\.([0-9]+)\.mlp\.gate_proj\.weight": (
-            r"model.layer_\1.mlp.gate_proj.kernel",
+            r"model.layers.\1.mlp.gate_proj.kernel",
             Transform.LINEAR,
         ),
         r"model\.layers\.([0-9]+)\.mlp\.up_proj\.weight": (
-            r"model.layer_\1.mlp.up_proj.kernel",
+            r"model.layers.\1.mlp.up_proj.kernel",
             Transform.LINEAR,
         ),
         r"model\.layers\.([0-9]+)\.mlp\.down_proj\.weight": (
-            r"model.layer_\1.mlp.down_proj.kernel",
+            r"model.layers.\1.mlp.down_proj.kernel",
             Transform.LINEAR,
         ),
         # mlp (moe)
         r"model\.layers\.([0-9]+)\.mlp\.gate\.weight": (
-            r"model.layer_\1.mlp.gate.weight",
+            r"model.layers.\1.mlp.gate.weight",
             Transform.BIAS,
         ),
         r"model\.layers\.([0-9]+)\.mlp\.gate\.e_score_correction_bias": (
-            r"model.layer_\1.mlp.gate.e_score_correction_bias",
+            r"model.layers.\1.mlp.gate.e_score_correction_bias",
             Transform.BIAS,
         ),
         r"model\.layers\.([0-9]+)\.mlp\.experts\.([0-9]+)\.gate_proj\.weight": (
-            r"model.layer_\1.mlp.expert_\2.gate_proj.kernel",
+            r"model.layers.\1.mlp.experts.\2.gate_proj.kernel",
             Transform.LINEAR,
         ),
         r"model\.layers\.([0-9]+)\.mlp\.experts\.([0-9]+)\.up_proj\.weight": (
-            r"model.layer_\1.mlp.expert_\2.up_proj.kernel",
+            r"model.layers.\1.mlp.experts.\2.up_proj.kernel",
             Transform.LINEAR,
         ),
         r"model\.layers\.([0-9]+)\.mlp\.experts\.([0-9]+)\.down_proj\.weight": (
-            r"model.layer_\1.mlp.expert_\2.down_proj.kernel",
+            r"model.layers.\1.mlp.experts.\2.down_proj.kernel",
             Transform.LINEAR,
         ),
         # norms + lm head
         r"model\.layers\.([0-9]+)\.input_layernorm\.weight": (
-            r"model.layer_\1.input_layernorm.weight",
+            r"model.layers.\1.input_layernorm.weight",
             Transform.SCALE,
         ),
         r"model\.layers\.([0-9]+)\.post_attention_layernorm\.weight": (
-            r"model.layer_\1.post_attention_layernorm.weight",
+            r"model.layers.\1.post_attention_layernorm.weight",
             Transform.SCALE,
         ),
         r"model\.norm\.weight": ("model.norm.weight", Transform.SCALE),
         r"lm_head\.weight": ("lm_head.kernel", Transform.LINEAR),
     }
-
-    return mapping
 
 
 def _should_skip_key(source_key: str) -> bool:
@@ -128,7 +122,7 @@ def _torch_key_to_jax_key(mapping, source_key):
     return subs[0]
 
 
-def _assign_weights(keys, tensor, state_dict, st_key, transform):
+def _assign_weights(keys, tensor, state_dict, st_key, transform, sharding_dict=None):
     key, *rest = keys
     if not rest:
         if transform is not None:
@@ -143,9 +137,13 @@ def _assign_weights(keys, tensor, state_dict, st_key, transform):
             raise ValueError(
                 f"Shape mismatch for {st_key}: {tensor.shape} vs {state_dict[key].shape}"
             )
-        state_dict[key] = jax.device_put(tensor)
+        if sharding_dict is not None:
+            state_dict[key] = jax.device_put(tensor, sharding_dict[key])
+        else:
+            state_dict[key] = jax.device_put(tensor)
     else:
-        _assign_weights(rest, tensor, state_dict[key], st_key, transform)
+        next_sharding = sharding_dict[key] if sharding_dict is not None else None
+        _assign_weights(rest, tensor, state_dict[key], st_key, transform, next_sharding)
 
 
 def _stoi(s):
@@ -155,33 +153,17 @@ def _stoi(s):
         return s
 
 
-def init_flax_params(
-    cfg: modeling.ModelConfig,
-    input_shape: Tuple[int, int] = (1, 1),
-    seed: int = 0,
-) -> Tuple[modeling.MiMoV2FlashForCausalLM, dict]:
-    model = modeling.MiMoV2FlashForCausalLM(cfg)
-    rng = jax.random.PRNGKey(seed)
-    input_ids = jnp.zeros(input_shape, dtype=jnp.int32)
-    attention_mask = jnp.ones(input_shape, dtype=jnp.int32)
-    params = model.init(
-        rng,
-        input_ids,
-        attention_mask=attention_mask,
-        logits_to_keep=1,
-        deterministic=True,
-    )
-    return model, params
-
-
-def convert_state_dict_to_flax(
+def create_model_from_torch_state_dict(
     torch_state: Dict[str, "torch.Tensor"],
-    flax_params: dict,
     cfg: modeling.ModelConfig,
-) -> dict:
+) -> nnx.Module:
+    import torch
 
-    params = unfreeze(flax_params)
-    state_dict = params["params"]
+    model = nnx.eval_shape(
+        lambda: modeling.MiMoV2FlashForCausalLM(cfg, rngs=nnx.Rngs(params=0, dropout=1))
+    )
+    graph_def, abs_state = nnx.split(model)
+    state_dict = nnx.to_pure_dict(abs_state)
 
     key_mapping = _get_key_and_transform_mapping(cfg)
     conversion_errors = []
@@ -213,31 +195,23 @@ def convert_state_dict_to_flax(
             "embedding"
         ].T
 
-    return freeze(params)
+    gc.collect()
+    return nnx.merge(graph_def, state_dict)
 
 
-def create_params_from_torch_state_dict(
-    torch_state: Dict[str, "torch.Tensor"],
-    cfg: modeling.ModelConfig,
-    input_shape: Tuple[int, int] = (1, 1),
-) -> Tuple[modeling.MiMoV2FlashForCausalLM, dict]:
-    model, params = init_flax_params(cfg, input_shape=input_shape)
-    params = convert_state_dict_to_flax(torch_state, params, cfg)
-    return model, params
-
-
-def create_params_from_safetensors(
+def create_model_from_safe_tensors(
     file_dir: str,
     cfg: modeling.ModelConfig,
-    input_shape: Tuple[int, int] = (1, 1),
-) -> Tuple[modeling.MiMoV2FlashForCausalLM, dict]:
+) -> nnx.Module:
     files = list(epath.Path(file_dir).expanduser().glob("*.safetensors"))
     if not files:
         raise ValueError(f"No safetensors found in {file_dir}")
 
-    model, params = init_flax_params(cfg, input_shape=input_shape)
-    params = unfreeze(params)
-    state_dict = params["params"]
+    model = nnx.eval_shape(
+        lambda: modeling.MiMoV2FlashForCausalLM(cfg, rngs=nnx.Rngs(params=0, dropout=1))
+    )
+    graph_def, abs_state = nnx.split(model)
+    state_dict = nnx.to_pure_dict(abs_state)
 
     key_mapping = _get_key_and_transform_mapping(cfg)
     conversion_errors = []
@@ -253,9 +227,7 @@ def create_params_from_safetensors(
                 tensor = sf.get_tensor(torch_key)
                 keys = [_stoi(k) for k in jax_key.split(".")]
                 try:
-                    _assign_weights(
-                        keys, tensor, state_dict, torch_key, transform.value
-                    )
+                    _assign_weights(keys, tensor, state_dict, torch_key, transform.value)
                 except Exception as e:
                     full_jax_key = ".".join([str(k) for k in keys])
                     conversion_errors.append(
@@ -274,7 +246,8 @@ def create_params_from_safetensors(
             "embedding"
         ].T
 
-    return model, freeze(params)
+    gc.collect()
+    return nnx.merge(graph_def, state_dict)
 
 
 def validate_index(index_path: str, cfg: modeling.ModelConfig | None = None) -> list[str]:
@@ -296,10 +269,8 @@ def validate_index(index_path: str, cfg: modeling.ModelConfig | None = None) -> 
 
 
 __all__ = [
-    "init_flax_params",
-    "convert_state_dict_to_flax",
-    "create_params_from_torch_state_dict",
-    "create_params_from_safetensors",
+    "create_model_from_torch_state_dict",
+    "create_model_from_safe_tensors",
     "validate_index",
 ]
 
