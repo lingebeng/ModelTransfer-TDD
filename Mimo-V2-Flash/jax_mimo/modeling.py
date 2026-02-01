@@ -147,8 +147,12 @@ class ModelConfig:
             swa_num_key_value_heads=getattr(torch_cfg, "swa_num_key_value_heads", None),
             swa_rope_theta=getattr(torch_cfg, "swa_rope_theta", 10000.0),
             attention_bias=getattr(torch_cfg, "attention_bias", False),
-            add_full_attention_sink_bias=getattr(torch_cfg, "add_full_attention_sink_bias", False),
-            add_swa_attention_sink_bias=getattr(torch_cfg, "add_swa_attention_sink_bias", False),
+            add_full_attention_sink_bias=getattr(
+                torch_cfg, "add_full_attention_sink_bias", False
+            ),
+            add_swa_attention_sink_bias=getattr(
+                torch_cfg, "add_swa_attention_sink_bias", False
+            ),
             n_routed_experts=getattr(torch_cfg, "n_routed_experts", None),
             num_experts_per_tok=getattr(torch_cfg, "num_experts_per_tok", 2),
             moe_intermediate_size=getattr(torch_cfg, "moe_intermediate_size", 512),
@@ -192,8 +196,10 @@ def make_attention_mask(
         allow = _causal_mask(seq_len)
     else:
         allow = _sliding_window_mask(seq_len, sliding_window)
-
+    # padding for batch and heads
     if attention_mask is not None:
+        # [batch,head,query,token_sequence(key)] though head_dim = 1, -> broadcast
+        # [B,1,1,T] & [1,1,T,T] = [B,1,T,T]
         key_mask = attention_mask[:, None, None, :].astype(bool)
         allow = allow[None, None, :, :] & key_mask
     else:
@@ -201,6 +207,7 @@ def make_attention_mask(
 
     zero = jnp.array(0.0, dtype=dtype)
     neg_inf = jnp.array(jnp.finfo(dtype).min, dtype=dtype)
+    # true -> 0     false -> -inf
     return jnp.where(allow, zero, neg_inf)
 
 
@@ -229,7 +236,9 @@ def apply_rotary_pos_emb(
 
 class RMSNorm(nnx.Module):
     def __init__(self, hidden_size: int, eps: float, *, rngs: nnx.Rngs):
-        self.weight = nnx.Param(nnx.initializers.ones_init()(rngs.params(), (hidden_size,)))
+        self.weight = nnx.Param(
+            nnx.initializers.ones_init()(rngs.params(), (hidden_size,))
+        )
         self.eps = eps
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
@@ -249,9 +258,15 @@ class MLP(nnx.Module):
         *,
         rngs: nnx.Rngs,
     ):
-        self.gate_proj = nnx.Linear(hidden_size, intermediate_size, use_bias=False, rngs=rngs)
-        self.up_proj = nnx.Linear(hidden_size, intermediate_size, use_bias=False, rngs=rngs)
-        self.down_proj = nnx.Linear(intermediate_size, hidden_size, use_bias=False, rngs=rngs)
+        self.gate_proj = nnx.Linear(
+            hidden_size, intermediate_size, use_bias=False, rngs=rngs
+        )
+        self.up_proj = nnx.Linear(
+            hidden_size, intermediate_size, use_bias=False, rngs=rngs
+        )
+        self.down_proj = nnx.Linear(
+            intermediate_size, hidden_size, use_bias=False, rngs=rngs
+        )
         self.act_fn = _get_act_fn(hidden_act)
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
@@ -264,7 +279,9 @@ class MiMoV2MoEGate(nnx.Module):
         self.top_k = config.num_experts_per_tok
         self.n_routed_experts = config.n_routed_experts
         self.routed_scaling_factor = (
-            config.routed_scaling_factor if config.routed_scaling_factor is not None else 1.0
+            config.routed_scaling_factor
+            if config.routed_scaling_factor is not None
+            else 1.0
         )
         self.scoring_func = config.scoring_func
         self.topk_method = config.topk_method
@@ -299,8 +316,12 @@ class MiMoV2MoEGate(nnx.Module):
             group_idx = jax.lax.top_k(group_scores, k=self.topk_group)[1]
 
             group_mask = jnp.zeros_like(group_scores)
-            group_mask = group_mask.at[jnp.arange(bsz * seq_len)[:, None], group_idx].set(1.0)
-            score_mask = jnp.repeat(group_mask[:, :, None], self.n_routed_experts // self.n_group, axis=-1)
+            group_mask = group_mask.at[
+                jnp.arange(bsz * seq_len)[:, None], group_idx
+            ].set(1.0)
+            score_mask = jnp.repeat(
+                group_mask[:, :, None], self.n_routed_experts // self.n_group, axis=-1
+            )
             score_mask = score_mask.reshape(bsz * seq_len, -1)
             tmp_scores = jnp.where(score_mask > 0, scores_for_choice, -jnp.inf)
             _, topk_idx = jax.lax.top_k(tmp_scores, k=self.top_k)
@@ -355,7 +376,9 @@ def repeat_kv(x: jnp.ndarray, n_rep: int) -> jnp.ndarray:
 
 
 class MiMoV2Attention(nnx.Module):
-    def __init__(self, config: ModelConfig, is_swa: bool, layer_idx: int, *, rngs: nnx.Rngs):
+    def __init__(
+        self, config: ModelConfig, is_swa: bool, layer_idx: int, *, rngs: nnx.Rngs
+    ):
         self.config = config
         self.is_swa = is_swa
         self.layer_idx = layer_idx
@@ -375,31 +398,45 @@ class MiMoV2Attention(nnx.Module):
 
         self.rope_dim = int(self.head_dim * config.partial_rotary_factor)
         self.num_key_value_groups = self.num_attention_heads // self.num_key_value_heads
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
 
         q_hidden_size = self.num_attention_heads * self.head_dim
         k_hidden_size = self.num_key_value_heads * self.head_dim
         v_hidden_size = self.num_key_value_heads * self.v_head_dim
         o_hidden_size = self.num_attention_heads * self.v_head_dim
 
-        self.q_proj = nnx.Linear(config.hidden_size, q_hidden_size, use_bias=config.attention_bias, rngs=rngs)
-        self.k_proj = nnx.Linear(config.hidden_size, k_hidden_size, use_bias=config.attention_bias, rngs=rngs)
-        self.v_proj = nnx.Linear(config.hidden_size, v_hidden_size, use_bias=config.attention_bias, rngs=rngs)
-        self.o_proj = nnx.Linear(o_hidden_size, config.hidden_size, use_bias=False, rngs=rngs)
+        self.q_proj = nnx.Linear(
+            config.hidden_size, q_hidden_size, use_bias=config.attention_bias, rngs=rngs
+        )
+        self.k_proj = nnx.Linear(
+            config.hidden_size, k_hidden_size, use_bias=config.attention_bias, rngs=rngs
+        )
+        self.v_proj = nnx.Linear(
+            config.hidden_size, v_hidden_size, use_bias=config.attention_bias, rngs=rngs
+        )
+        self.o_proj = nnx.Linear(
+            o_hidden_size, config.hidden_size, use_bias=False, rngs=rngs
+        )
         self.dropout = nnx.Dropout(config.attention_dropout, rngs=rngs)
         self.use_sink = (config.add_swa_attention_sink_bias and is_swa) or (
             config.add_full_attention_sink_bias and not is_swa
         )
         if self.use_sink:
             self.attention_sink_bias = nnx.Param(
-                nnx.initializers.zeros_init()(rngs.params(), (self.num_attention_heads,))
+                nnx.initializers.zeros_init()(
+                    rngs.params(), (self.num_attention_heads,)
+                )
             )
         else:
             self.attention_sink_bias = None
 
-    def _apply_rope(self, q: jnp.ndarray, k: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    def _apply_rope(
+        self, q: jnp.ndarray, k: jnp.ndarray
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
         seq_len = q.shape[-2]
-        cos, sin = build_rope_cache(seq_len, self.rope_dim, theta=self.rope_theta, dtype=q.dtype)
+        cos, sin = build_rope_cache(
+            seq_len, self.rope_dim, theta=self.rope_theta, dtype=q.dtype
+        )
         q_rope, q_nope = jnp.split(q, [self.rope_dim], axis=-1)
         k_rope, k_nope = jnp.split(k, [self.rope_dim], axis=-1)
         q_rope, k_rope = apply_rotary_pos_emb(q_rope, k_rope, cos, sin)
@@ -420,9 +457,15 @@ class MiMoV2Attention(nnx.Module):
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
 
-        q = q.reshape(bsz, seq_len, self.num_attention_heads, self.head_dim).transpose(0, 2, 1, 3)
-        k = k.reshape(bsz, seq_len, self.num_key_value_heads, self.head_dim).transpose(0, 2, 1, 3)
-        v = v.reshape(bsz, seq_len, self.num_key_value_heads, self.v_head_dim).transpose(0, 2, 1, 3)
+        q = q.reshape(bsz, seq_len, self.num_attention_heads, self.head_dim).transpose(
+            0, 2, 1, 3
+        )
+        k = k.reshape(bsz, seq_len, self.num_key_value_heads, self.head_dim).transpose(
+            0, 2, 1, 3
+        )
+        v = v.reshape(
+            bsz, seq_len, self.num_key_value_heads, self.v_head_dim
+        ).transpose(0, 2, 1, 3)
 
         q, k = self._apply_rope(q, k)
 
@@ -453,7 +496,9 @@ class MiMoV2DecoderLayer(nnx.Module):
         self.config = config
         self.layer_idx = layer_idx
         is_swa_layer = config.hybrid_layer_pattern[layer_idx] == 1
-        self.attention_type = "sliding_window_attention" if is_swa_layer else "full_attention"
+        self.attention_type = (
+            "sliding_window_attention" if is_swa_layer else "full_attention"
+        )
         self.self_attn = MiMoV2Attention(config, is_swa_layer, layer_idx, rngs=rngs)
         if config.n_routed_experts is not None and config.moe_layer_freq[layer_idx]:
             self.mlp = MiMoV2MoE(config, rngs=rngs)
@@ -464,8 +509,12 @@ class MiMoV2DecoderLayer(nnx.Module):
                 hidden_act=config.hidden_act,
                 rngs=rngs,
             )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon, rngs=rngs)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon, rngs=rngs)
+        self.input_layernorm = RMSNorm(
+            config.hidden_size, eps=config.layernorm_epsilon, rngs=rngs
+        )
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.layernorm_epsilon, rngs=rngs
+        )
 
     def __call__(
         self,
@@ -496,7 +545,10 @@ class MiMoV2Model(nnx.Module):
         self.config = config
         self.embed_tokens = nnx.Embed(config.vocab_size, config.hidden_size, rngs=rngs)
         self.layers = nnx.List(
-            [MiMoV2DecoderLayer(config, layer_idx=i, rngs=rngs) for i in range(config.num_hidden_layers)]
+            [
+                MiMoV2DecoderLayer(config, layer_idx=i, rngs=rngs)
+                for i in range(config.num_hidden_layers)
+            ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon, rngs=rngs)
 
@@ -510,12 +562,17 @@ class MiMoV2Model(nnx.Module):
         hidden_states = self.embed_tokens(input_ids)
         position_ids = jnp.broadcast_to(jnp.arange(seq_len)[None, :], (1, seq_len))
 
-        full_mask = make_attention_mask(attention_mask, seq_len, sliding_window=None, dtype=hidden_states.dtype)
+        full_mask = make_attention_mask(
+            attention_mask, seq_len, sliding_window=None, dtype=hidden_states.dtype
+        )
         if self.config.sliding_window is None:
             swa_mask = full_mask
         else:
             swa_mask = make_attention_mask(
-                attention_mask, seq_len, sliding_window=self.config.sliding_window, dtype=hidden_states.dtype
+                attention_mask,
+                seq_len,
+                sliding_window=self.config.sliding_window,
+                dtype=hidden_states.dtype,
             )
 
         for layer in self.layers:
@@ -535,7 +592,9 @@ class MiMoV2FlashForCausalLM(nnx.Module):
     def __init__(self, config: ModelConfig, *, rngs: nnx.Rngs):
         self.config = config
         self.model = MiMoV2Model(config, rngs=rngs)
-        self.lm_head = nnx.Linear(config.hidden_size, config.vocab_size, use_bias=False, rngs=rngs)
+        self.lm_head = nnx.Linear(
+            config.hidden_size, config.vocab_size, use_bias=False, rngs=rngs
+        )
 
     def __call__(
         self,
@@ -544,7 +603,9 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         logits_to_keep: int = 0,
         deterministic: bool = True,
     ) -> jnp.ndarray:
-        hidden_states = self.model(input_ids, attention_mask=attention_mask, deterministic=deterministic)
+        hidden_states = self.model(
+            input_ids, attention_mask=attention_mask, deterministic=deterministic
+        )
         if logits_to_keep:
             hidden_states = hidden_states[:, -logits_to_keep:, :]
         logits = self.lm_head(hidden_states)

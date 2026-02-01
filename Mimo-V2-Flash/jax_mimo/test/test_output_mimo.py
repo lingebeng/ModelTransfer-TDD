@@ -14,7 +14,10 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 from transformers.cache_utils import DynamicCache
-from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+from transformers.masking_utils import (
+    create_causal_mask,
+    create_sliding_window_causal_mask,
+)
 
 
 def _load_package():
@@ -72,7 +75,9 @@ class TestTinyForward(absltest.TestCase):
                     torch.nn.init.zeros_(module.e_score_correction_bias)
 
         jax_cfg = modeling.ModelConfig.from_torch_config(torch_cfg)
-        jax_model = params.create_model_from_torch_state_dict(torch_model.state_dict(), jax_cfg)
+        jax_model = params.create_model_from_torch_state_dict(
+            torch_model.state_dict(), jax_cfg
+        )
 
         self.torch_model = torch_model
         self.jax_model = jax_model
@@ -81,9 +86,13 @@ class TestTinyForward(absltest.TestCase):
         self.batch_size = 2
         self.seq_len = 5
 
-    def _setup_torch_attn(self, input_embeds: torch.Tensor, attention_mask: torch.Tensor):
+    def _setup_torch_attn(
+        self, input_embeds: torch.Tensor, attention_mask: torch.Tensor
+    ):
         past_key_values = DynamicCache(config=self.torch_model.config)
-        past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
+        past_seen = (
+            past_key_values.get_seq_length() if past_key_values is not None else 0
+        )
         cache_position = torch.arange(
             past_seen, past_seen + input_embeds.shape[1], device=input_embeds.device
         )
@@ -98,11 +107,15 @@ class TestTinyForward(absltest.TestCase):
         }
         causal_mask_mapping = {"full_attention": create_causal_mask(**mask_kwargs)}
         if self.torch_model.model.has_sliding_layers:
-            causal_mask_mapping["sliding_window_attention"] = create_sliding_window_causal_mask(
-                **mask_kwargs
+            causal_mask_mapping["sliding_window_attention"] = (
+                create_sliding_window_causal_mask(**mask_kwargs)
             )
-        position_embeddings = self.torch_model.model.rotary_emb(input_embeds, position_ids)
-        swa_position_embeddings = self.torch_model.model.swa_rotary_emb(input_embeds, position_ids)
+        position_embeddings = self.torch_model.model.rotary_emb(
+            input_embeds, position_ids
+        )
+        swa_position_embeddings = self.torch_model.model.swa_rotary_emb(
+            input_embeds, position_ids
+        )
         return {
             "position_ids": position_ids,
             "cache_position": cache_position,
@@ -112,7 +125,9 @@ class TestTinyForward(absltest.TestCase):
         }
 
     def test_embedder(self):
-        tx = torch.randint(0, self.torch_cfg.vocab_size, size=(self.batch_size, self.seq_len))
+        tx = torch.randint(
+            0, self.torch_cfg.vocab_size, size=(self.batch_size, self.seq_len)
+        )
         ty = self.torch_model.model.embed_tokens(tx)
         jx = jnp.asarray(tx.numpy())
         jy = self.jax_model.model.embed_tokens(jx)
@@ -145,7 +160,10 @@ class TestTinyForward(absltest.TestCase):
         is_swa = layer.attention_type == "sliding_window_attention"
         attention_mask = torch.ones((self.batch_size, self.seq_len), dtype=torch.int64)
         input_embeds = torch.randn(
-            self.batch_size, self.seq_len, self.torch_cfg.hidden_size, dtype=torch.float32
+            self.batch_size,
+            self.seq_len,
+            self.torch_cfg.hidden_size,
+            dtype=torch.float32,
         )
         torch_inputs = self._setup_torch_attn(input_embeds, attention_mask)
         attn_mask = torch_inputs["attention_mask_mapping"][layer.attention_type]
@@ -184,7 +202,9 @@ class TestTinyForward(absltest.TestCase):
         )
 
     def test_tiny_forward_logits(self):
-        tx = torch.randint(1, self.torch_cfg.vocab_size, size=(self.batch_size, self.seq_len))
+        tx = torch.randint(
+            1, self.torch_cfg.vocab_size, size=(self.batch_size, self.seq_len)
+        )
         with torch.no_grad():
             t_logits = self.torch_model(
                 input_ids=tx,
@@ -206,12 +226,13 @@ class TestTinyForward(absltest.TestCase):
         t_logits_np = t_logits.float().detach().numpy()
         self.assertFalse(np.isnan(j_logits_np).any(), "JAX logits contain NaNs")
         self.assertFalse(np.isnan(t_logits_np).any(), "Torch logits contain NaNs")
-
+        print(j_logits_np)
+        print(t_logits_np)
         np.testing.assert_allclose(
             j_logits_np,
             t_logits_np,
-            rtol=1e-3,
-            atol=1e-3,
+            rtol=1e-5,
+            atol=1e-5,
         )
 
 
