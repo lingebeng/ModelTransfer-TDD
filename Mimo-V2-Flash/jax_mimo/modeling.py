@@ -217,18 +217,12 @@ def rotate_half(x: jnp.ndarray) -> jnp.ndarray:
 
 
 def build_rope_cache(seq_len: int, dim: int, theta: float, dtype: jnp.dtype):
-    print(f"Building RoPE cache with seq_len={seq_len}, dim={dim}, theta={theta}")
     inv_freq = 1.0 / (theta ** (jnp.arange(0, dim, 2) / dim))
-    print(f"inv_freq: {inv_freq}")
     positions = jnp.arange(seq_len, dtype=dtype)
     freqs = jnp.einsum("i,j->ij", positions, inv_freq)
-    print(f"freqs: {freqs}")
     emb = jnp.concatenate([freqs, freqs], axis=-1)
-    print(f"emb: {emb}")
     cos = jnp.cos(emb)[None, None, :, :]
     sin = jnp.sin(emb)[None, None, :, :]
-    print(f"cos: {cos}")
-    print(f"sin: {sin}")
     return cos, sin
 
 
@@ -476,8 +470,6 @@ class MiMoV2Attention(nnx.Module):
         k = repeat_kv(k, self.num_key_value_groups)
         v = repeat_kv(v, self.num_key_value_groups)
         attn_weights = jnp.einsum("bhqd,bhkd->bhqk", q, k) * self.scaling
-        print(attention_mask.shape)
-        print(attn_weights.shape)
         if attention_mask is not None:
             attn_weights = attn_weights + attention_mask
         if self.use_sink:
@@ -493,7 +485,6 @@ class MiMoV2Attention(nnx.Module):
 
         attn_output = jnp.einsum("bhqk,bhkd->bhqd", attn_probs, v)
         attn_output = attn_output.transpose(0, 2, 1, 3).reshape(bsz, seq_len, -1)
-        exit()
         return self.o_proj(attn_output)
 
 

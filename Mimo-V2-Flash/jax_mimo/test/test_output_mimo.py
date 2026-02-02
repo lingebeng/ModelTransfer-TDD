@@ -201,6 +201,166 @@ class TestTinyForward(absltest.TestCase):
             atol=1e-3,
         )
 
+    def test_self_attention_all_layers(self):
+        attention_mask = torch.ones((self.batch_size, self.seq_len), dtype=torch.int64)
+        input_embeds = torch.randn(
+            self.batch_size,
+            self.seq_len,
+            self.torch_cfg.hidden_size,
+            dtype=torch.float32,
+        )
+        torch_inputs = self._setup_torch_attn(input_embeds, attention_mask)
+        jx = jnp.asarray(input_embeds.numpy())
+        j_attn_mask_full = modeling.make_attention_mask(
+            jnp.asarray(attention_mask.numpy()),
+            self.seq_len,
+            sliding_window=None,
+            dtype=jx.dtype,
+        )
+        j_attn_mask_swa = modeling.make_attention_mask(
+            jnp.asarray(attention_mask.numpy()),
+            self.seq_len,
+            sliding_window=self.jax_cfg.sliding_window,
+            dtype=jx.dtype,
+        )
+
+        for idx, layer in enumerate(self.torch_model.model.layers):
+            is_swa = layer.attention_type == "sliding_window_attention"
+            attn_mask = torch_inputs["attention_mask_mapping"][layer.attention_type]
+            pos_emb = (
+                torch_inputs["swa_position_embeddings"]
+                if is_swa
+                else torch_inputs["position_embeddings"]
+            )
+            ty, _ = layer.self_attn(
+                input_embeds,
+                position_embeddings=pos_emb,
+                attention_mask=attn_mask,
+                past_key_values=None,
+                cache_position=torch_inputs["cache_position"],
+                position_ids=torch_inputs["position_ids"],
+            )
+
+            j_mask = j_attn_mask_swa if is_swa else j_attn_mask_full
+            jy = self.jax_model.model.layers[idx].self_attn(
+                jx,
+                attention_mask=j_mask,
+                position_ids=None,
+                deterministic=True,
+            )
+            np.testing.assert_allclose(
+                np.array(jy, dtype=np.float32),
+                ty.detach().cpu().numpy(),
+                rtol=1e-3,
+                atol=1e-3,
+            )
+
+    def test_decoder_layer0(self):
+        layer = self.torch_model.model.layers[0].to(torch.float32)
+        attention_mask = torch.ones((self.batch_size, self.seq_len), dtype=torch.int64)
+        input_embeds = torch.randn(
+            self.batch_size,
+            self.seq_len,
+            self.torch_cfg.hidden_size,
+            dtype=torch.float32,
+        )
+        torch_inputs = self._setup_torch_attn(input_embeds, attention_mask)
+        attn_mask = torch_inputs["attention_mask_mapping"][layer.attention_type]
+        pos_emb = (
+            torch_inputs["swa_position_embeddings"]
+            if layer.attention_type == "sliding_window_attention"
+            else torch_inputs["position_embeddings"]
+        )
+        ty = layer(
+            input_embeds,
+            attention_mask=attn_mask,
+            position_embeddings=pos_emb,
+            position_ids=torch_inputs["position_ids"],
+            past_key_values=None,
+            cache_position=torch_inputs["cache_position"],
+            use_cache=False,
+        )
+
+        jx = jnp.asarray(input_embeds.numpy())
+        j_mask = modeling.make_attention_mask(
+            jnp.asarray(attention_mask.numpy()),
+            self.seq_len,
+            sliding_window=self.jax_cfg.sliding_window
+            if layer.attention_type == "sliding_window_attention"
+            else None,
+            dtype=jx.dtype,
+        )
+        jy = self.jax_model.model.layers[0](
+            jx,
+            attention_mask=j_mask,
+            position_ids=None,
+            deterministic=True,
+        )
+        np.testing.assert_allclose(
+            np.array(jy, dtype=np.float32),
+            ty.detach().cpu().numpy(),
+            rtol=1e-3,
+            atol=1e-3,
+        )
+
+    def test_all_decoder_layers(self):
+        attention_mask = torch.ones((self.batch_size, self.seq_len), dtype=torch.int64)
+        input_embeds = torch.randn(
+            self.batch_size,
+            self.seq_len,
+            self.torch_cfg.hidden_size,
+            dtype=torch.float32,
+        )
+        torch_inputs = self._setup_torch_attn(input_embeds, attention_mask)
+        jx = jnp.asarray(input_embeds.numpy())
+        j_attn_mask_full = modeling.make_attention_mask(
+            jnp.asarray(attention_mask.numpy()),
+            self.seq_len,
+            sliding_window=None,
+            dtype=jx.dtype,
+        )
+        j_attn_mask_swa = modeling.make_attention_mask(
+            jnp.asarray(attention_mask.numpy()),
+            self.seq_len,
+            sliding_window=self.jax_cfg.sliding_window,
+            dtype=jx.dtype,
+        )
+
+        for idx, layer in enumerate(self.torch_model.model.layers):
+            attn_mask = torch_inputs["attention_mask_mapping"][layer.attention_type]
+            pos_emb = (
+                torch_inputs["swa_position_embeddings"]
+                if layer.attention_type == "sliding_window_attention"
+                else torch_inputs["position_embeddings"]
+            )
+            ty = layer(
+                input_embeds,
+                attention_mask=attn_mask,
+                position_embeddings=pos_emb,
+                position_ids=torch_inputs["position_ids"],
+                past_key_values=None,
+                cache_position=torch_inputs["cache_position"],
+                use_cache=False,
+            )
+
+            j_mask = (
+                j_attn_mask_swa
+                if layer.attention_type == "sliding_window_attention"
+                else j_attn_mask_full
+            )
+            jy = self.jax_model.model.layers[idx](
+                jx,
+                attention_mask=j_mask,
+                position_ids=None,
+                deterministic=True,
+            )
+            np.testing.assert_allclose(
+                np.array(jy, dtype=np.float32),
+                ty.detach().cpu().numpy(),
+                rtol=1e-3,
+                atol=1e-3,
+            )
+
     def test_tiny_forward_logits(self):
         tx = torch.randint(
             1, self.torch_cfg.vocab_size, size=(self.batch_size, self.seq_len)
@@ -226,8 +386,6 @@ class TestTinyForward(absltest.TestCase):
         t_logits_np = t_logits.float().detach().numpy()
         self.assertFalse(np.isnan(j_logits_np).any(), "JAX logits contain NaNs")
         self.assertFalse(np.isnan(t_logits_np).any(), "Torch logits contain NaNs")
-        print(j_logits_np)
-        print(t_logits_np)
         np.testing.assert_allclose(
             j_logits_np,
             t_logits_np,

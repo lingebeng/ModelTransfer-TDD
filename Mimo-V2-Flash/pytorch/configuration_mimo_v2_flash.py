@@ -131,7 +131,7 @@ class MiMoV2FlashConfig(PretrainedConfig):
         return cls(
             vocab_size=8192,
             hidden_size=hidden_size,
-            intermediate_size=768,
+            intermediate_size=1024,
             num_hidden_layers=num_hidden_layers,
             num_attention_heads=num_attention_heads,
             num_key_value_heads=2,
