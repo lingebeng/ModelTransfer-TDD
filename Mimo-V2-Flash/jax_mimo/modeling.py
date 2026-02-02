@@ -198,7 +198,7 @@ def make_attention_mask(
         allow = _sliding_window_mask(seq_len, sliding_window)
     # padding for batch and heads
     if attention_mask is not None:
-        # [batch,head,query,token_sequence(key)] though head_dim = 1, -> broadcast
+        # [batch,head,t,t] though head_dim = 1, -> broadcast
         # [B,1,1,T] & [1,1,T,T] = [B,1,T,T]
         key_mask = attention_mask[:, None, None, :].astype(bool)
         allow = allow[None, None, :, :] & key_mask
@@ -217,12 +217,18 @@ def rotate_half(x: jnp.ndarray) -> jnp.ndarray:
 
 
 def build_rope_cache(seq_len: int, dim: int, theta: float, dtype: jnp.dtype):
+    print(f"Building RoPE cache with seq_len={seq_len}, dim={dim}, theta={theta}")
     inv_freq = 1.0 / (theta ** (jnp.arange(0, dim, 2) / dim))
+    print(f"inv_freq: {inv_freq}")
     positions = jnp.arange(seq_len, dtype=dtype)
     freqs = jnp.einsum("i,j->ij", positions, inv_freq)
+    print(f"freqs: {freqs}")
     emb = jnp.concatenate([freqs, freqs], axis=-1)
+    print(f"emb: {emb}")
     cos = jnp.cos(emb)[None, None, :, :]
     sin = jnp.sin(emb)[None, None, :, :]
+    print(f"cos: {cos}")
+    print(f"sin: {sin}")
     return cos, sin
 
 
@@ -314,7 +320,6 @@ class MiMoV2MoEGate(nnx.Module):
             group_top2 = jax.lax.top_k(grouped, k=2)[0]
             group_scores = group_top2.sum(axis=-1)
             group_idx = jax.lax.top_k(group_scores, k=self.topk_group)[1]
-
             group_mask = jnp.zeros_like(group_scores)
             group_mask = group_mask.at[
                 jnp.arange(bsz * seq_len)[:, None], group_idx
@@ -358,14 +363,13 @@ class MiMoV2MoE(nnx.Module):
         topk_idx, topk_weight = self.gate(hidden_states)
         x = hidden_states.reshape(-1, hidden_states.shape[-1])
         final = jnp.zeros_like(x)
-
+        # @haifeng: this can be optimized
         for expert_idx, expert in enumerate(self.experts):
             mask = jnp.any(topk_idx == expert_idx, axis=-1)
             weights = jnp.where(topk_idx == expert_idx, topk_weight, 0.0).sum(axis=-1)
             expert_out = expert(x)
             weighted = expert_out * weights[:, None]
             final = final + jnp.where(mask[:, None], weighted, 0.0)
-
         return final.reshape(orig_shape)
 
 
@@ -375,6 +379,7 @@ def repeat_kv(x: jnp.ndarray, n_rep: int) -> jnp.ndarray:
     return jnp.repeat(x, repeats=n_rep, axis=1)
 
 
+# @haifeng: this can be optimized
 class MiMoV2Attention(nnx.Module):
     def __init__(
         self, config: ModelConfig, is_swa: bool, layer_idx: int, *, rngs: nnx.Rngs
@@ -456,7 +461,6 @@ class MiMoV2Attention(nnx.Module):
         q = self.q_proj(hidden_states)
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
-
         q = q.reshape(bsz, seq_len, self.num_attention_heads, self.head_dim).transpose(
             0, 2, 1, 3
         )
@@ -466,13 +470,14 @@ class MiMoV2Attention(nnx.Module):
         v = v.reshape(
             bsz, seq_len, self.num_key_value_heads, self.v_head_dim
         ).transpose(0, 2, 1, 3)
-
         q, k = self._apply_rope(q, k)
 
+        # @haifeng: XLA will optimize this
         k = repeat_kv(k, self.num_key_value_groups)
         v = repeat_kv(v, self.num_key_value_groups)
-
         attn_weights = jnp.einsum("bhqd,bhkd->bhqk", q, k) * self.scaling
+        print(attention_mask.shape)
+        print(attn_weights.shape)
         if attention_mask is not None:
             attn_weights = attn_weights + attention_mask
         if self.use_sink:
@@ -488,6 +493,7 @@ class MiMoV2Attention(nnx.Module):
 
         attn_output = jnp.einsum("bhqk,bhkd->bhqd", attn_probs, v)
         attn_output = attn_output.transpose(0, 2, 1, 3).reshape(bsz, seq_len, -1)
+        exit()
         return self.o_proj(attn_output)
 
 

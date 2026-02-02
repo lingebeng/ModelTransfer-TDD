@@ -3,8 +3,8 @@ import dataclasses
 import json
 import os
 import sys
+from pathlib import Path
 
-import jax
 import jax.numpy as jnp
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
@@ -26,7 +26,10 @@ def _load_model_config(path: str) -> modeling.ModelConfig:
     if "moe_layer_freq" in cfg_kwargs and cfg_kwargs["moe_layer_freq"] is not None:
         cfg_kwargs["moe_layer_freq"] = [bool(x) for x in cfg_kwargs["moe_layer_freq"]]
 
-    if "hybrid_layer_pattern" in cfg_kwargs and cfg_kwargs["hybrid_layer_pattern"] is not None:
+    if (
+        "hybrid_layer_pattern" in cfg_kwargs
+        and cfg_kwargs["hybrid_layer_pattern"] is not None
+    ):
         cfg_kwargs["hybrid_layer_pattern"] = [
             int(x) for x in cfg_kwargs["hybrid_layer_pattern"]
         ]
@@ -37,15 +40,73 @@ def _load_model_config(path: str) -> modeling.ModelConfig:
     return modeling.ModelConfig(**cfg_kwargs)
 
 
+def _resolve_ckpt_dir(args: argparse.Namespace) -> str:
+    if args.ckpt_dir:
+        return args.ckpt_dir
+
+    try:
+        from huggingface_hub import snapshot_download
+    except Exception as exc:  # pragma: no cover - runtime dependency on server
+        raise RuntimeError(
+            "huggingface_hub is required when --ckpt-dir is not provided. "
+            "Install it or pass --ckpt-dir."
+        ) from exc
+
+    return snapshot_download(
+        repo_id=args.model_id,
+        revision=args.hf_revision,
+        cache_dir=args.hf_cache_dir,
+        token=args.hf_token,
+        allow_patterns=[
+            "*.safetensors",
+            "*.safetensors.index.json",
+            "config.json",
+        ],
+    )
+
+
+def _resolve_config_json(args: argparse.Namespace, ckpt_dir: str) -> str:
+    if args.config_json:
+        return args.config_json
+    hf_config = Path(ckpt_dir) / "config.json"
+    if hf_config.exists():
+        return str(hf_config)
+    return os.path.join(
+        os.path.dirname(os.path.dirname(__file__)), "config", "config.json"
+    )
+
+
 def run_big_model() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt-dir", required=True, help="Directory with sharded safetensors.")
+    parser.add_argument(
+        "--ckpt-dir",
+        default=None,
+        help="Local directory with sharded safetensors. If omitted, download from HF.",
+    )
+    parser.add_argument(
+        "--model-id",
+        default="XiaomiMiMo/MiMo-V2-Flash",
+        help="Hugging Face model id used when --ckpt-dir is omitted.",
+    )
+    parser.add_argument(
+        "--hf-revision",
+        default=None,
+        help="Optional Hugging Face revision/branch/tag/commit.",
+    )
+    parser.add_argument(
+        "--hf-cache-dir",
+        default=None,
+        help="Optional Hugging Face cache directory.",
+    )
+    parser.add_argument(
+        "--hf-token",
+        default=os.environ.get("HF_TOKEN"),
+        help="Optional Hugging Face token. Defaults to $HF_TOKEN.",
+    )
     parser.add_argument(
         "--config-json",
-        default=os.path.join(
-            os.path.dirname(os.path.dirname(__file__)), "config", "config.json"
-        ),
-        help="Path to config.json.",
+        default=None,
+        help="Path to config.json. Default: <ckpt-dir>/config.json if present.",
     )
     parser.add_argument(
         "--validate-only",
@@ -55,17 +116,21 @@ def run_big_model() -> None:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--seq-len", type=int, default=8)
     args = parser.parse_args()
+    ckpt_dir = _resolve_ckpt_dir(args)
+    config_json = _resolve_config_json(args, ckpt_dir)
+    print(f"Using checkpoint dir: {ckpt_dir}")
+    print(f"Using config json: {config_json}")
 
     if args.validate_only:
-        index_path = os.path.join(args.ckpt_dir, "model.safetensors.index.json")
+        index_path = os.path.join(ckpt_dir, "model.safetensors.index.json")
         missing = params.validate_index(index_path)
         print(f"missing keys: {len(missing)}")
         if missing:
             print("\n".join(missing))
         return
 
-    cfg = _load_model_config(args.config_json)
-    model = params.create_model_from_safe_tensors(args.ckpt_dir, cfg)
+    cfg = _load_model_config(config_json)
+    model = params.create_model_from_safe_tensors(ckpt_dir, cfg)
 
     input_ids = jnp.zeros((args.batch_size, args.seq_len), dtype=jnp.int32)
     attention_mask = jnp.ones_like(input_ids)
