@@ -35,6 +35,14 @@ def run_model() -> None:
     )
     print("logits shape:", logits.shape)
 
+    # KV cache demo (prefill + single-step decode)
+    cache = model.init_cache(batch_size=batch_size, max_seq_len=seq_len + 2)
+    _ = model(input_ids, attention_mask=attention_mask, cache=cache, deterministic=True)
+    next_ids = jax.random.randint(key, (batch_size, 1), 0, cfg.vocab_size)
+    next_mask = jnp.ones((batch_size, seq_len + 1), dtype=jnp.int32)
+    step_logits = model(next_ids, attention_mask=next_mask, cache=cache, deterministic=True)
+    print("kv logits shape:", step_logits.shape)
+
 
 if __name__ == "__main__":
     run_model()

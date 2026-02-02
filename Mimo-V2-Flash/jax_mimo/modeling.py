@@ -1,5 +1,5 @@
 import dataclasses
-from typing import Callable, Optional, Sequence, Tuple
+from typing import Callable, Optional, Sequence, Tuple, TypeAlias, List
 
 import jax
 import jax.numpy as jnp
@@ -168,6 +168,52 @@ class ModelConfig:
         )
 
 
+class LayerCache(nnx.Module):
+    def __init__(
+        self,
+        batch_size: int,
+        max_seq_len: int,
+        num_kv_heads: int,
+        head_dim: int,
+        v_head_dim: int,
+        dtype: jnp.dtype,
+    ):
+        self.k_cache = nnx.Cache(
+            jnp.zeros((batch_size, max_seq_len, num_kv_heads, head_dim), dtype=dtype)
+        )
+        self.v_cache = nnx.Cache(
+            jnp.zeros((batch_size, max_seq_len, num_kv_heads, v_head_dim), dtype=dtype)
+        )
+        self.cur_pos = nnx.Variable(jnp.array(0, dtype=jnp.int32))
+
+
+Cache: TypeAlias = List[LayerCache]
+
+
+def init_cache(
+    cfg: ModelConfig,
+    batch_size: int,
+    max_seq_len: int,
+    dtype: jnp.dtype = jnp.float32,
+) -> Cache:
+    caches: Cache = []
+    for layer_idx in range(cfg.num_hidden_layers):
+        is_swa = cfg.hybrid_layer_pattern[layer_idx] == 1
+        num_kv_heads = cfg.swa_num_key_value_heads if is_swa else cfg.num_key_value_heads
+        head_dim = cfg.swa_head_dim if is_swa else cfg.head_dim
+        v_head_dim = cfg.swa_v_head_dim if is_swa else cfg.v_head_dim
+        caches.append(
+            LayerCache(
+                batch_size=batch_size,
+                max_seq_len=max_seq_len,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                v_head_dim=v_head_dim,
+                dtype=dtype,
+            )
+        )
+    return caches
+
 def _get_act_fn(name: str) -> Callable[[jnp.ndarray], jnp.ndarray]:
     if name == "silu":
         return jax.nn.silu
@@ -211,15 +257,46 @@ def make_attention_mask(
     return jnp.where(allow, zero, neg_inf)
 
 
+def make_attention_mask_kv(
+    attention_mask: Optional[jnp.ndarray],
+    q_len: int,
+    kv_len: int,
+    sliding_window: Optional[int],
+    dtype: jnp.dtype,
+    q_positions: Optional[jnp.ndarray] = None,
+) -> jnp.ndarray:
+    if q_positions is None:
+        q_positions = jnp.arange(kv_len - q_len, kv_len)
+    k_positions = jnp.arange(kv_len)
+    allow = k_positions[None, :] <= q_positions[:, None]
+    if sliding_window is not None:
+        allow = allow & ((q_positions[:, None] - k_positions[None, :]) < sliding_window)
+
+    allow = allow[None, None, :, :]
+    if attention_mask is not None:
+        key_mask = attention_mask[:, None, None, :].astype(bool)
+        allow = allow & key_mask
+
+    zero = jnp.array(0.0, dtype=dtype)
+    neg_inf = jnp.array(jnp.finfo(dtype).min, dtype=dtype)
+    return jnp.where(allow, zero, neg_inf)
+
+
 def rotate_half(x: jnp.ndarray) -> jnp.ndarray:
     x1, x2 = jnp.split(x, 2, axis=-1)
     return jnp.concatenate([-x2, x1], axis=-1)
 
 
 def build_rope_cache(seq_len: int, dim: int, theta: float, dtype: jnp.dtype):
-    inv_freq = 1.0 / (theta ** (jnp.arange(0, dim, 2) / dim))
     positions = jnp.arange(seq_len, dtype=dtype)
-    freqs = jnp.einsum("i,j->ij", positions, inv_freq)
+    return build_rope_cache_from_positions(positions, dim, theta, dtype)
+
+
+def build_rope_cache_from_positions(
+    positions: jnp.ndarray, dim: int, theta: float, dtype: jnp.dtype
+):
+    inv_freq = 1.0 / (theta ** (jnp.arange(0, dim, 2) / dim))
+    freqs = jnp.einsum("i,j->ij", positions.astype(dtype), inv_freq)
     emb = jnp.concatenate([freqs, freqs], axis=-1)
     cos = jnp.cos(emb)[None, None, :, :]
     sin = jnp.sin(emb)[None, None, :, :]
@@ -430,12 +507,18 @@ class MiMoV2Attention(nnx.Module):
             self.attention_sink_bias = None
 
     def _apply_rope(
-        self, q: jnp.ndarray, k: jnp.ndarray
+        self, q: jnp.ndarray, k: jnp.ndarray, position_ids: Optional[jnp.ndarray]
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
         seq_len = q.shape[-2]
-        cos, sin = build_rope_cache(
-            seq_len, self.rope_dim, theta=self.rope_theta, dtype=q.dtype
-        )
+        if position_ids is None:
+            cos, sin = build_rope_cache(
+                seq_len, self.rope_dim, theta=self.rope_theta, dtype=q.dtype
+            )
+        else:
+            positions = jnp.asarray(position_ids).reshape(-1)
+            cos, sin = build_rope_cache_from_positions(
+                positions, self.rope_dim, theta=self.rope_theta, dtype=q.dtype
+            )
         q_rope, q_nope = jnp.split(q, [self.rope_dim], axis=-1)
         k_rope, k_nope = jnp.split(k, [self.rope_dim], axis=-1)
         q_rope, k_rope = apply_rotary_pos_emb(q_rope, k_rope, cos, sin)
@@ -448,9 +531,9 @@ class MiMoV2Attention(nnx.Module):
         hidden_states: jnp.ndarray,
         attention_mask: Optional[jnp.ndarray],
         position_ids: Optional[jnp.ndarray],
+        cache: Optional[LayerCache] = None,
         deterministic: bool = True,
     ) -> jnp.ndarray:
-        del position_ids
         bsz, seq_len, _ = hidden_states.shape
         q = self.q_proj(hidden_states)
         k = self.k_proj(hidden_states)
@@ -464,9 +547,28 @@ class MiMoV2Attention(nnx.Module):
         v = v.reshape(
             bsz, seq_len, self.num_key_value_heads, self.v_head_dim
         ).transpose(0, 2, 1, 3)
-        q, k = self._apply_rope(q, k)
+        q, k = self._apply_rope(q, k, position_ids)
 
-        # @haifeng: XLA will optimize this
+        if cache is not None:
+            start_pos = int(cache.cur_pos[()])
+            k_to_store = k.transpose(0, 2, 1, 3)
+            v_to_store = v.transpose(0, 2, 1, 3)
+            k_cache = cache.k_cache[...]
+            v_cache = cache.v_cache[...]
+            k_cache = k_cache.at[:, start_pos : start_pos + seq_len, :, :].set(
+                k_to_store
+            )
+            v_cache = v_cache.at[:, start_pos : start_pos + seq_len, :, :].set(
+                v_to_store
+            )
+            cache.k_cache[...] = k_cache
+            cache.v_cache[...] = v_cache
+
+            kv_len = start_pos + seq_len
+            k = k_cache[:, :kv_len, :, :].transpose(0, 2, 1, 3)
+            v = v_cache[:, :kv_len, :, :].transpose(0, 2, 1, 3)
+            cache.cur_pos[...] = start_pos + seq_len
+
         k = repeat_kv(k, self.num_key_value_groups)
         v = repeat_kv(v, self.num_key_value_groups)
         attn_weights = jnp.einsum("bhqd,bhkd->bhqk", q, k) * self.scaling
@@ -518,6 +620,7 @@ class MiMoV2DecoderLayer(nnx.Module):
         hidden_states: jnp.ndarray,
         attention_mask: Optional[jnp.ndarray],
         position_ids: jnp.ndarray,
+        cache: Optional[LayerCache] = None,
         deterministic: bool = True,
     ) -> jnp.ndarray:
         residual = hidden_states
@@ -526,6 +629,7 @@ class MiMoV2DecoderLayer(nnx.Module):
             hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            cache=cache,
             deterministic=deterministic,
         )
         hidden_states = residual + hidden_states
@@ -549,35 +653,73 @@ class MiMoV2Model(nnx.Module):
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon, rngs=rngs)
 
+    def init_cache(
+        self, batch_size: int, max_seq_len: int, dtype: jnp.dtype = jnp.float32
+    ) -> Cache:
+        return init_cache(self.config, batch_size, max_seq_len, dtype=dtype)
+
     def __call__(
         self,
         input_ids: jnp.ndarray,
         attention_mask: Optional[jnp.ndarray] = None,
+        cache: Optional[Cache] = None,
+        cache_position: Optional[jnp.ndarray] = None,
         deterministic: bool = True,
     ) -> jnp.ndarray:
         _, seq_len = input_ids.shape
         hidden_states = self.embed_tokens(input_ids)
-        position_ids = jnp.broadcast_to(jnp.arange(seq_len)[None, :], (1, seq_len))
-
-        full_mask = make_attention_mask(
-            attention_mask, seq_len, sliding_window=None, dtype=hidden_states.dtype
-        )
-        if self.config.sliding_window is None:
-            swa_mask = full_mask
-        else:
-            swa_mask = make_attention_mask(
-                attention_mask,
-                seq_len,
-                sliding_window=self.config.sliding_window,
-                dtype=hidden_states.dtype,
+        if cache is None:
+            position_ids = jnp.broadcast_to(
+                jnp.arange(seq_len)[None, :], (1, seq_len)
             )
+            full_mask = make_attention_mask(
+                attention_mask, seq_len, sliding_window=None, dtype=hidden_states.dtype
+            )
+            if self.config.sliding_window is None:
+                swa_mask = full_mask
+            else:
+                swa_mask = make_attention_mask(
+                    attention_mask,
+                    seq_len,
+                    sliding_window=self.config.sliding_window,
+                    dtype=hidden_states.dtype,
+                )
+        else:
+            if cache_position is None:
+                start_pos = int(cache[0].cur_pos[()])
+                cache_position = jnp.arange(
+                    start_pos, start_pos + seq_len, dtype=jnp.int32
+                )
+            position_ids = cache_position[None, :]
+            kv_len = int(cache[0].cur_pos[()]) + seq_len
+            full_mask = make_attention_mask_kv(
+                attention_mask,
+                q_len=seq_len,
+                kv_len=kv_len,
+                sliding_window=None,
+                dtype=hidden_states.dtype,
+                q_positions=cache_position,
+            )
+            if self.config.sliding_window is None:
+                swa_mask = full_mask
+            else:
+                swa_mask = make_attention_mask_kv(
+                    attention_mask,
+                    q_len=seq_len,
+                    kv_len=kv_len,
+                    sliding_window=self.config.sliding_window,
+                    dtype=hidden_states.dtype,
+                    q_positions=cache_position,
+                )
 
-        for layer in self.layers:
+        for layer_idx, layer in enumerate(self.layers):
             mask = full_mask if layer.attention_type == "full_attention" else swa_mask
+            layer_cache = cache[layer_idx] if cache is not None else None
             hidden_states = layer(
                 hidden_states,
                 attention_mask=mask,
                 position_ids=position_ids,
+                cache=layer_cache,
                 deterministic=deterministic,
             )
 
@@ -593,15 +735,26 @@ class MiMoV2FlashForCausalLM(nnx.Module):
             config.hidden_size, config.vocab_size, use_bias=False, rngs=rngs
         )
 
+    def init_cache(
+        self, batch_size: int, max_seq_len: int, dtype: jnp.dtype = jnp.float32
+    ) -> Cache:
+        return init_cache(self.config, batch_size, max_seq_len, dtype=dtype)
+
     def __call__(
         self,
         input_ids: jnp.ndarray,
         attention_mask: Optional[jnp.ndarray] = None,
+        cache: Optional[Cache] = None,
+        cache_position: Optional[jnp.ndarray] = None,
         logits_to_keep: int = 0,
         deterministic: bool = True,
     ) -> jnp.ndarray:
         hidden_states = self.model(
-            input_ids, attention_mask=attention_mask, deterministic=deterministic
+            input_ids,
+            attention_mask=attention_mask,
+            cache=cache,
+            cache_position=cache_position,
+            deterministic=deterministic,
         )
         if logits_to_keep:
             hidden_states = hidden_states[:, -logits_to_keep:, :]
@@ -611,6 +764,9 @@ class MiMoV2FlashForCausalLM(nnx.Module):
 
 __all__ = [
     "ModelConfig",
+    "LayerCache",
+    "Cache",
+    "init_cache",
     "MiMoV2FlashForCausalLM",
     "MiMoV2Model",
     "MiMoV2DecoderLayer",
@@ -618,4 +774,5 @@ __all__ = [
     "MiMoV2MoE",
     "RMSNorm",
     "make_attention_mask",
+    "make_attention_mask_kv",
 ]

@@ -393,6 +393,64 @@ class TestTinyForward(absltest.TestCase):
             atol=1e-5,
         )
 
+    def test_kv_cache_prefill_decode(self):
+        prefix_len = self.seq_len
+        prefix_ids = torch.randint(
+            1, self.torch_cfg.vocab_size, size=(self.batch_size, prefix_len)
+        )
+        next_ids = torch.randint(
+            1, self.torch_cfg.vocab_size, size=(self.batch_size, 1)
+        )
+
+        prefix_mask = torch.ones_like(prefix_ids)
+        full_mask = torch.ones(
+            (self.batch_size, prefix_len + 1), dtype=torch.int64
+        )
+
+        with torch.no_grad():
+            prefill = self.torch_model(
+                input_ids=prefix_ids,
+                attention_mask=prefix_mask,
+                use_cache=True,
+            )
+            t_past = prefill.past_key_values
+            t_step = self.torch_model(
+                input_ids=next_ids,
+                attention_mask=full_mask,
+                past_key_values=t_past,
+                use_cache=True,
+                logits_to_keep=1,
+            ).logits
+
+        j_prefix = jnp.asarray(prefix_ids.numpy())
+        j_next = jnp.asarray(next_ids.numpy())
+        j_prefix_mask = jnp.ones((self.batch_size, prefix_len), dtype=jnp.int32)
+        j_full_mask = jnp.ones((self.batch_size, prefix_len + 1), dtype=jnp.int32)
+
+        cache = self.jax_model.init_cache(
+            batch_size=self.batch_size, max_seq_len=prefix_len + 1, dtype=jnp.float32
+        )
+        _ = self.jax_model(
+            j_prefix,
+            attention_mask=j_prefix_mask,
+            cache=cache,
+            deterministic=True,
+        )
+        j_step = self.jax_model(
+            j_next,
+            attention_mask=j_full_mask,
+            cache=cache,
+            logits_to_keep=1,
+            deterministic=True,
+        )
+
+        np.testing.assert_allclose(
+            np.array(j_step, dtype=np.float32),
+            t_step.float().detach().numpy(),
+            rtol=1e-3,
+            atol=1e-3,
+        )
+
 
 if __name__ == "__main__":
     absltest.main()
