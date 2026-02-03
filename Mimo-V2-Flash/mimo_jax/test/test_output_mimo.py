@@ -65,7 +65,7 @@ class TestTinyForward(absltest.TestCase):
         torch_cfg.rope_scaling = {"rope_type": "linear", "factor": 1.0}
         torch_cfg._attn_implementation = "eager"
         if getattr(torch_cfg, "sliding_window", None) is None:
-            torch_cfg.sliding_window = 8
+            torch_cfg.sliding_window = 4
 
         torch_model = MiMoV2FlashForCausalLM(torch_cfg).eval()
         for module in torch_model.modules():
@@ -151,8 +151,8 @@ class TestTinyForward(absltest.TestCase):
         np.testing.assert_allclose(
             np.array(jy, dtype=np.float32),
             ty.detach().cpu().numpy(),
-            rtol=1e-3,
-            atol=1e-3,
+            rtol=1e-5,
+            atol=1e-5,
         )
 
     def test_self_attention_layer0(self):
@@ -197,8 +197,8 @@ class TestTinyForward(absltest.TestCase):
         np.testing.assert_allclose(
             np.array(jy, dtype=np.float32),
             ty.detach().cpu().numpy(),
-            rtol=1e-3,
-            atol=1e-3,
+            rtol=1e-5,
+            atol=1e-5,
         )
 
     def test_self_attention_all_layers(self):
@@ -251,8 +251,8 @@ class TestTinyForward(absltest.TestCase):
             np.testing.assert_allclose(
                 np.array(jy, dtype=np.float32),
                 ty.detach().cpu().numpy(),
-                rtol=1e-3,
-                atol=1e-3,
+                rtol=1e-5,
+                atol=1e-5,
             )
 
     def test_decoder_layer0(self):
@@ -299,8 +299,8 @@ class TestTinyForward(absltest.TestCase):
         np.testing.assert_allclose(
             np.array(jy, dtype=np.float32),
             ty.detach().cpu().numpy(),
-            rtol=1e-3,
-            atol=1e-3,
+            rtol=1e-5,
+            atol=1e-5,
         )
 
     def test_all_decoder_layers(self):
@@ -357,8 +357,8 @@ class TestTinyForward(absltest.TestCase):
             np.testing.assert_allclose(
                 np.array(jy, dtype=np.float32),
                 ty.detach().cpu().numpy(),
-                rtol=1e-3,
-                atol=1e-3,
+                rtol=1e-5,
+                atol=1e-5,
             )
 
     def test_tiny_forward_logits(self):
@@ -384,6 +384,8 @@ class TestTinyForward(absltest.TestCase):
 
         j_logits_np = np.array(j_logits, dtype=np.float32)
         t_logits_np = t_logits.float().detach().numpy()
+        print("JAX logits:", j_logits_np)
+        print("Torch logits:", t_logits_np)
         self.assertFalse(np.isnan(j_logits_np).any(), "JAX logits contain NaNs")
         self.assertFalse(np.isnan(t_logits_np).any(), "Torch logits contain NaNs")
         np.testing.assert_allclose(

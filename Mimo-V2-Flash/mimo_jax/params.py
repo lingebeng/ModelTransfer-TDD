@@ -11,6 +11,7 @@ from etils import epath
 from flax import nnx
 
 from . import modeling
+import torch
 
 
 def _get_key_and_transform_mapping(cfg: modeling.ModelConfig):
@@ -21,7 +22,10 @@ def _get_key_and_transform_mapping(cfg: modeling.ModelConfig):
         SCALE = None
 
     return {
-        r"model\.embed_tokens\.weight": ("model.embed_tokens.embedding", Transform.EMBED),
+        r"model\.embed_tokens\.weight": (
+            "model.embed_tokens.embedding",
+            Transform.EMBED,
+        ),
         # attention
         r"model\.layers\.([0-9]+)\.self_attn\.q_proj\.weight": (
             r"model.layers.\1.self_attn.q_proj.kernel",
@@ -154,11 +158,9 @@ def _stoi(s):
 
 
 def create_model_from_torch_state_dict(
-    torch_state: Dict[str, "torch.Tensor"],
+    torch_state: Dict[str, torch.Tensor],
     cfg: modeling.ModelConfig,
 ) -> nnx.Module:
-    import torch
-
     model = nnx.eval_shape(
         lambda: modeling.MiMoV2FlashForCausalLM(cfg, rngs=nnx.Rngs(params=0, dropout=1))
     )
@@ -227,7 +229,9 @@ def create_model_from_safe_tensors(
                 tensor = sf.get_tensor(torch_key)
                 keys = [_stoi(k) for k in jax_key.split(".")]
                 try:
-                    _assign_weights(keys, tensor, state_dict, torch_key, transform.value)
+                    _assign_weights(
+                        keys, tensor, state_dict, torch_key, transform.value
+                    )
                 except Exception as e:
                     full_jax_key = ".".join([str(k) for k in keys])
                     conversion_errors.append(
@@ -250,7 +254,9 @@ def create_model_from_safe_tensors(
     return nnx.merge(graph_def, state_dict)
 
 
-def validate_index(index_path: str, cfg: modeling.ModelConfig | None = None) -> list[str]:
+def validate_index(
+    index_path: str, cfg: modeling.ModelConfig | None = None
+) -> list[str]:
     if cfg is None:
         cfg = modeling.ModelConfig()
     index_path = epath.Path(index_path).expanduser()
@@ -277,9 +283,13 @@ __all__ = [
 
 if __name__ == "__main__":
     default_index = (
-        epath.Path(__file__).resolve().parent / "config" / "model.safetensors.index.json"
+        epath.Path(__file__).resolve().parent
+        / "config"
+        / "model.safetensors.index.json"
     )
-    index_path = epath.Path(sys.argv[1]).expanduser() if len(sys.argv) > 1 else default_index
+    index_path = (
+        epath.Path(sys.argv[1]).expanduser() if len(sys.argv) > 1 else default_index
+    )
     missing_keys = validate_index(str(index_path))
     print(f"missing keys: {len(missing_keys)}")
     if missing_keys:

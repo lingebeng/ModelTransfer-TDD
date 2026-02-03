@@ -15,9 +15,5 @@ dependencies = [
 ]
 # pyproject.toml
 [tool.ruff.lint.per-file-ignores]
-# 忽略所有 smoke_test 文件的 E402 错误
-"**/smoke_test_*.py" = ["E402"]
-# 或者忽略整个 pytorch 目录下的 E402
-"Mimo-V2-Flash/pytorch/*.py" = ["E402"]
-# 忽略 test 目录下所有文件的 E402 错误
+"Mimo-V2-Flash/mimo_*/*.py" = ["E402"]
 "**/test/**/*.py" = ["E402"]

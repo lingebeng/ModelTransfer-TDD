@@ -46,7 +46,9 @@ def _debug_tensor(name: str, tensor: torch.Tensor | None) -> None:
         return
     if t.is_floating_point():
         stats = (float(t.min().item()), float(t.max().item()), float(t.mean().item()))
-        print(f"{name}.stats: min={stats[0]:.4g} max={stats[1]:.4g} mean={stats[2]:.4g}")
+        print(
+            f"{name}.stats: min={stats[0]:.4g} max={stats[1]:.4g} mean={stats[2]:.4g}"
+        )
     else:
         stats = (int(t.min().item()), int(t.max().item()))
         print(f"{name}.stats: min={stats[0]} max={stats[1]}")
@@ -118,7 +120,9 @@ def _enable_debug_tracing(model: MiMoV2FlashForCausalLM) -> None:
         _debug_tensor("position_ids", position_ids)
 
         if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+            raise ValueError(
+                "You must specify exactly one of input_ids or inputs_embeds"
+            )
 
         if inputs_embeds is None:
             inputs_embeds = module.embed_tokens(input_ids)
@@ -251,7 +255,9 @@ def _enable_debug_tracing(model: MiMoV2FlashForCausalLM) -> None:
 
         residual = hidden_states
         hidden_states = module.post_attention_layernorm(hidden_states)
-        _debug_tensor("layer.hidden_states(after post_attention_layernorm)", hidden_states)
+        _debug_tensor(
+            "layer.hidden_states(after post_attention_layernorm)", hidden_states
+        )
         hidden_states = module.mlp(hidden_states)
         _debug_tensor("layer.mlp_or_moe_output", hidden_states)
         hidden_states = residual + hidden_states
@@ -268,7 +274,9 @@ def _enable_debug_tracing(model: MiMoV2FlashForCausalLM) -> None:
         input_shape = hidden_states.shape[:-1]
         qk_hidden_shape = (*input_shape, -1, module.head_dim)
         v_hidden_shape = (*input_shape, -1, module.v_head_dim)
-        query_states = module.q_proj(hidden_states).view(qk_hidden_shape).transpose(1, 2)
+        query_states = (
+            module.q_proj(hidden_states).view(qk_hidden_shape).transpose(1, 2)
+        )
         key_states = module.k_proj(hidden_states).view(qk_hidden_shape).transpose(1, 2)
         value_states = module.v_proj(hidden_states).view(v_hidden_shape).transpose(1, 2)
         _debug_tensor("attn.query_states", query_states)
