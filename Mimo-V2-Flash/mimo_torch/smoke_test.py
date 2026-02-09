@@ -13,9 +13,9 @@ if ROOT_DIR not in sys.path:
 
 import torch
 
-from pytorch.configuration_mimo_v2_flash import MiMoV2FlashConfig
-from pytorch import modeling_mimo_v2_flash as modeling
-from pytorch.modeling_mimo_v2_flash import MiMoV2FlashForCausalLM
+from mimo_torch.configuration_mimo_v2_flash import MiMoV2FlashConfig
+from mimo_torch import modeling_mimo_v2_flash as modeling
+from mimo_torch.modeling_mimo_v2_flash import MiMoV2FlashForCausalLM
 
 
 _orig_eager_attention_forward = modeling.eager_attention_forward

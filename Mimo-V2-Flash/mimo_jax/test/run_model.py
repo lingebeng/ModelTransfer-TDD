@@ -9,7 +9,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from jax_mimo import modeling
+from mimo_jax import modeling
 
 
 def run_model() -> None:

@@ -37,10 +37,10 @@ def _load_package():
 
 _load_package()
 
-from mimo_v2_flash.jax_mimo import modeling, params
-from mimo_v2_flash.pytorch.configuration_mimo_v2_flash import MiMoV2FlashConfig
-from mimo_v2_flash.pytorch.modeling_mimo_v2_flash import MiMoV2FlashForCausalLM
-import mimo_v2_flash.pytorch.modeling_mimo_v2_flash as mimo_flash
+from mimo_v2_flash.mimo_jax import modeling, params
+from mimo_v2_flash.mimo_torch.configuration_mimo_v2_flash import MiMoV2FlashConfig
+from mimo_v2_flash.mimo_torch.modeling_mimo_v2_flash import MiMoV2FlashForCausalLM
+import mimo_v2_flash.mimo_torch.modeling_mimo_v2_flash as mimo_flash
 
 
 class TestTinyForward(absltest.TestCase):
